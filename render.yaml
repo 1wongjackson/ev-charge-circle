@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: ev-charge-circle
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      # Paste your Neon connection string when Render asks for it.
+      - key: DATABASE_URL
+        sync: false

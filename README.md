@@ -13,9 +13,9 @@ A small web app for office EV drivers who share one charger.
 - **Community feed**: a live feed of all activity, plus free-text broadcasts. It updates instantly over Server-Sent Events.
 - **Charger usage**: sessions, hours, average session length, how busy the charger is during office hours (Mon–Fri 8am–6pm), and the on-time finish rate. Also shows charts of hours per day and the busiest hours, and a per-driver breakdown with overstays.
 
-## Run
+## Run locally
 
-Requires Node.js 22.13 or newer (it uses the built-in `node:sqlite`, so there are no native modules to compile).
+Requires Node.js 20 or newer. You don't need a database server: without `DATABASE_URL`, the app uses PGlite (an embedded Postgres) stored in `data/pglite`.
 
 ```bash
 npm install
@@ -24,19 +24,30 @@ npm start
 
 Then open http://localhost:3000.
 
+## Deploy (Render free + Neon free Postgres)
+
+1. **Database:** create a free project at https://neon.tech and copy its connection string (`postgresql://…?sslmode=require`).
+2. **App:** in https://dashboard.render.com, choose **New → Blueprint** and connect this GitHub repo. Render reads `render.yaml`.
+3. When asked for `DATABASE_URL`, paste the Neon connection string, then click **Apply**. Tables are created automatically on first start.
+4. Share the `https://<name>.onrender.com` URL with your colleagues.
+
+The free Render plan sleeps after about 15 minutes without traffic. The first visit afterwards takes roughly 30 seconds, and overdue reminders aren't sent while the app is asleep. Data lives in Neon, so nothing is lost.
+
 ### Configuration (environment variables)
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `PORT` | `3000` | HTTP port |
-| `DB_PATH` | `data/evcircle.db` | SQLite database file |
+| `DATABASE_URL` | — | Postgres connection string (production) |
+| `PGLITE_DIR` | `data/pglite` | Local embedded database folder, used when `DATABASE_URL` is unset |
 | `RESERVE_MINUTES` | `15` | How long the charger is held for the next driver in the queue |
 | `NODE_ENV` | — | Set to `production` to mark cookies `Secure` (requires HTTPS) |
 
 ## Structure
 
 - `server.js`: Express API, auth, charger/queue rules, live event stream, overdue checker
-- `db.js`: SQLite schema
+- `db.js`: Postgres connection (or embedded PGlite locally) and schema
+- `render.yaml`: Render deployment blueprint
 - `public/`: the single-page frontend (plain HTML/CSS/JS)
 
 ## API
