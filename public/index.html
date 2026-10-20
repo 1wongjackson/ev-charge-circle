@@ -12,6 +12,10 @@
     <div class="brand"><span class="bolt">⚡</span> EV Charge Circle</div>
     <div id="userbar" class="userbar" hidden>
       <span id="charger-pill" class="pill"></span>
+      <div class="seg units-toggle" role="group" aria-label="Distance units">
+        <button type="button" data-units="imperial">mi</button>
+        <button type="button" data-units="metric">km</button>
+      </div>
       <button id="notify-btn" class="ghost small" type="button">Enable alerts</button>
       <span id="me-name" class="muted"></span>
       <button id="logout-btn" class="ghost small" type="button">Log out</button>
@@ -29,22 +33,29 @@
         <button class="tab" data-auth="register" type="button">Register</button>
       </div>
 
-      <form id="login-form" class="form">
+      <form id="login-form" class="form" method="post" action="#">
         <label>Email <input name="email" type="email" autocomplete="email" required /></label>
         <label>Password <input name="password" type="password" autocomplete="current-password" required /></label>
         <button type="submit">Log in</button>
       </form>
 
-      <form id="register-form" class="form" hidden>
+      <form id="register-form" class="form" method="post" action="#" hidden>
         <label>Name <input name="name" autocomplete="name" required maxlength="60" /></label>
         <label>Email <input name="email" type="email" autocomplete="email" required /></label>
         <label>Password <input name="password" type="password" autocomplete="new-password" minlength="8" required /></label>
         <label>Car model <input name="car_model" placeholder="e.g. Tesla Model 3" required maxlength="60" /></label>
+        <div class="units-field">
+          <span>Distance units</span>
+          <div class="seg" role="group" aria-label="Distance units">
+            <button type="button" data-reg-units="imperial">Miles</button>
+            <button type="button" data-reg-units="metric">Kilometres</button>
+          </div>
+        </div>
         <div class="row">
-          <label>Full-charge range (mi) <input name="full_range_mi" type="number" min="10" max="1000" value="250" required /></label>
+          <label>Full-charge range (<span class="u-dist">mi</span>) <input name="full_range_mi" type="number" min="10" max="1600" value="250" required /></label>
           <label>Current charge (%) <input name="charge_level" type="number" min="0" max="100" value="50" required /></label>
         </div>
-        <label>Miles you drive per day <input name="daily_miles" type="number" min="0" max="1000" value="30" required /></label>
+        <label>Daily driving (<span class="u-dist">mi</span>) <input name="daily_miles" type="number" min="0" max="1600" value="30" required /></label>
         <button type="submit">Create account</button>
       </form>
       <p id="auth-error" class="error" role="alert"></p>
@@ -96,8 +107,8 @@
               <input name="charge_level" id="charge-range" type="range" min="0" max="100" step="1" />
             </label>
             <div class="row">
-              <label>Miles / day <input name="daily_miles" type="number" min="0" max="1000" step="1" required /></label>
-              <label>Full range (mi) <input name="full_range_mi" type="number" min="10" max="1000" step="1" required /></label>
+              <label>Daily driving (<span class="u-dist">mi</span>) <input name="daily_miles" type="number" min="0" max="1600" step="1" required /></label>
+              <label>Full range (<span class="u-dist">mi</span>) <input name="full_range_mi" type="number" min="10" max="1600" step="1" required /></label>
             </div>
             <label>Car model <input name="car_model" maxlength="60" required /></label>
             <button type="submit">Update my status</button>

@@ -86,6 +86,13 @@ function str(value, name, maxLen, { optional = false } = {}) {
   return s;
 }
 
+const UNITS = ['imperial', 'metric'];
+function units(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  if (!UNITS.includes(value)) throw new HttpError(400, 'Units must be imperial or metric');
+  return value;
+}
+
 function futureTime(value) {
   const d = new Date(value);
   if (!value || Number.isNaN(d.getTime())) throw new HttpError(400, 'Expected end time is required');
@@ -248,13 +255,14 @@ app.post('/api/register', async (req, res) => {
   const fullRange = num(b.full_range_mi, 'Full-charge range', 10, 1000);
   const charge = num(b.charge_level, 'Charge level', 0, 100, 50);
   const daily = num(b.daily_miles, 'Daily mileage', 0, 1000, 30);
+  const unitPref = units(b.units, 'imperial');
 
   const now = nowIso();
   const created = await one(
-    `INSERT INTO users(name, email, password_hash, car_model, full_range_mi, charge_level, daily_miles, updated_at, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `INSERT INTO users(name, email, password_hash, car_model, full_range_mi, charge_level, daily_miles, units, updated_at, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      ON CONFLICT (email) DO NOTHING RETURNING id`,
-    [name, email, hashPassword(password), carModel, fullRange, charge, daily, now, now]
+    [name, email, hashPassword(password), carModel, fullRange, charge, daily, unitPref, now, now]
   );
   if (!created) throw new HttpError(409, 'An account with that email already exists');
   await startSession(res, created.id);
@@ -289,7 +297,7 @@ app.get('/api/state', auth, async (req, res) => {
   const drivers = (await all('SELECT * FROM users ORDER BY name')).map(publicUser);
   const events = (await all(`${eventSelect} ORDER BY e.id DESC LIMIT 60`)).map(formatEvent);
   res.json({
-    me: publicUser(req.user),
+    me: { ...publicUser(req.user), units: req.user.units },
     drivers,
     charger: await chargerState(),
     events,
@@ -310,6 +318,12 @@ app.put('/api/me', auth, async (req, res) => {
   );
   await logEvent('status', u.id, { charge_level: charge, daily_miles: daily });
   res.json({ ok: true });
+});
+
+app.put('/api/me/preferences', auth, async (req, res) => {
+  const unitPref = units(req.body?.units, req.user.units);
+  await all('UPDATE users SET units = $1 WHERE id = $2', [unitPref, req.user.id]);
+  res.json({ ok: true, units: unitPref });
 });
 
 app.post('/api/broadcast', auth, async (req, res) => {

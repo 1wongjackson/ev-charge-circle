@@ -75,6 +75,9 @@ await rawExec(`
     created_at     TEXT NOT NULL
   );
 
+  -- Display preference only; distances are always stored in miles.
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS units TEXT NOT NULL DEFAULT 'imperial';
+
   CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT

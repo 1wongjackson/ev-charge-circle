@@ -8,6 +8,48 @@ let stream = null;
 let statusDirty = false;
 let usageDays = 30;
 
+// ---------- units ----------
+// Distances are stored in miles; 'metric' only changes what's shown and typed.
+
+const KM_PER_MI = 1.609344;
+const IMPERIAL_REGIONS = ['US', 'GB', 'LR', 'MM'];
+let units = guessUnits();
+
+function guessUnits() {
+  try {
+    const saved = localStorage.getItem('units');
+    if (saved === 'imperial' || saved === 'metric') return saved;
+  } catch {}
+  const region = (navigator.language || '').split('-')[1]?.toUpperCase();
+  return IMPERIAL_REGIONS.includes(region) ? 'imperial' : 'metric';
+}
+
+const distUnit = () => (units === 'metric' ? 'km' : 'mi');
+/** Miles -> number shown in the current units. */
+const showDist = (mi) => Math.round(units === 'metric' ? mi * KM_PER_MI : mi);
+/** Typed value in the current units -> miles for the API. */
+const inputToMiles = (v) => (v === '' || v == null ? v : units === 'metric' ? Number(v) / KM_PER_MI : Number(v));
+
+function applyUnits() {
+  try { localStorage.setItem('units', units); } catch {}
+  $$('.u-dist').forEach((el) => (el.textContent = distUnit()));
+  $$('[data-units], [data-reg-units]').forEach((b) =>
+    b.classList.toggle('active', (b.dataset.units || b.dataset.regUnits) === units)
+  );
+  // Server limits are 1000 mi; keep the input limits equivalent.
+  const max = units === 'metric' ? 1600 : 1000;
+  $$('input[name="full_range_mi"], input[name="daily_miles"]').forEach((i) => (i.max = max));
+}
+
+function convertDistInputs(form, from, to) {
+  if (from === to) return;
+  const factor = to === 'metric' ? KM_PER_MI : 1 / KM_PER_MI;
+  for (const name of ['full_range_mi', 'daily_miles']) {
+    const input = form[name];
+    if (input.value !== '') input.value = Math.round(Number(input.value) * factor);
+  }
+}
+
 // ---------- utilities ----------
 
 function esc(s) {
@@ -95,6 +137,11 @@ async function submitAuth(e, url) {
   e.preventDefault();
   $('#auth-error').textContent = '';
   const body = Object.fromEntries(new FormData(e.target));
+  if (url === '/api/register') {
+    body.full_range_mi = inputToMiles(body.full_range_mi);
+    body.daily_miles = inputToMiles(body.daily_miles);
+    body.units = units;
+  }
   try {
     await api(url, { method: 'POST', body });
     e.target.reset();
@@ -103,6 +150,26 @@ async function submitAuth(e, url) {
     $('#auth-error').textContent = err.message;
   }
 }
+$$('[data-reg-units]').forEach((btn) =>
+  btn.addEventListener('click', () => {
+    convertDistInputs($('#register-form'), units, btn.dataset.regUnits);
+    units = btn.dataset.regUnits;
+    applyUnits();
+  })
+);
+
+$$('[data-units]').forEach((btn) =>
+  btn.addEventListener('click', async () => {
+    if (btn.dataset.units === units) return;
+    units = btn.dataset.units;
+    statusDirty = false; // re-fill "My car" in the new units
+    applyUnits();
+    render();
+    if (!$('#view-usage').hidden) loadUsage();
+    await api('/api/me/preferences', { method: 'PUT', body: { units } }).catch((err) => toast(err.message));
+  })
+);
+
 $('#login-form').addEventListener('submit', (e) => submitAuth(e, '/api/login'));
 $('#register-form').addEventListener('submit', (e) => submitAuth(e, '/api/register'));
 
@@ -131,6 +198,8 @@ async function boot() {
   } catch {
     return showAuth();
   }
+  units = state.me.units;
+  applyUnits();
   showApp();
   updateNotifyBtn();
   render();
@@ -366,8 +435,8 @@ function renderDrivers() {
           <span class="battery-pct">${lvl}%</span>
         </div>
         <div class="driver-stats">
-          <div><strong>${d.est_range_mi}</strong>mi left</div>
-          <div><strong>${d.daily_miles}</strong>mi / day</div>
+          <div><strong>${showDist(d.est_range_mi)}</strong>${distUnit()} left</div>
+          <div><strong>${showDist(d.daily_miles)}</strong>${distUnit()} / day</div>
           <div><strong>${d.days_of_range ?? '—'}</strong>days</div>
         </div>
         <div class="driver-foot"><span>Updated ${ago(d.updated_at)}</span>${badge}</div>
@@ -381,8 +450,8 @@ function renderStatusForm() {
   const f = $('#status-form');
   f.charge_level.value = state.me.charge_level;
   $('#charge-out').textContent = state.me.charge_level;
-  f.daily_miles.value = state.me.daily_miles;
-  f.full_range_mi.value = state.me.full_range_mi;
+  f.daily_miles.value = showDist(state.me.daily_miles);
+  f.full_range_mi.value = showDist(state.me.full_range_mi);
   f.car_model.value = state.me.car_model;
 }
 
@@ -395,7 +464,10 @@ $('#status-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const msg = $('#status-msg');
   try {
-    await api('/api/me', { method: 'PUT', body: Object.fromEntries(new FormData(e.target)) });
+    const body = Object.fromEntries(new FormData(e.target));
+    body.daily_miles = inputToMiles(body.daily_miles);
+    body.full_range_mi = inputToMiles(body.full_range_mi);
+    await api('/api/me', { method: 'PUT', body });
     statusDirty = false;
     msg.textContent = 'Saved.';
     setTimeout(() => (msg.textContent = ''), 2500);
@@ -421,7 +493,7 @@ function eventText(ev) {
   const d = ev.data || {};
   switch (ev.type) {
     case 'registered': return `👋 ${a} joined the community (${esc(d.car_model)})`;
-    case 'status': return `🔋 ${a} is at ${d.charge_level}%, driving ${d.daily_miles} mi/day`;
+    case 'status': return `🔋 ${a} is at ${d.charge_level}%, driving ${showDist(d.daily_miles)} ${distUnit()}/day`;
     case 'start': return `⚡ ${a} plugged in — expects to be done at <strong>${fmtTime(d.expected_end)}</strong>`;
     case 'extend': return `🕒 ${a} now expects to be done at <strong>${fmtTime(d.expected_end)}</strong>`;
     case 'end': return `✅ ${a} unplugged after ${fmtDuration(d.minutes)}${d.end_level != null ? ` at ${d.end_level}%` : ''} — charger is free`;
@@ -595,4 +667,6 @@ document.addEventListener('mousemove', (e) => {
 // Keep countdowns and "x minutes ago" fresh.
 setInterval(() => state && render(), 30_000);
 
+convertDistInputs($('#register-form'), 'imperial', units); // defaults in the HTML are miles
+applyUnits();
 boot();
