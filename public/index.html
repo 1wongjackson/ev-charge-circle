@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EV Charge Circle</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="bolt">⚡</span> EV Charge Circle</div>
+    <div id="userbar" class="userbar" hidden>
+      <span id="charger-pill" class="pill"></span>
+      <button id="notify-btn" class="ghost small" type="button">Enable alerts</button>
+      <span id="me-name" class="muted"></span>
+      <button id="logout-btn" class="ghost small" type="button">Log out</button>
+    </div>
+  </header>
+
+  <!-- ===== Auth ===== -->
+  <main id="auth-view" class="auth">
+    <section class="card auth-card">
+      <h1>Share one charger, without the hallway politics.</h1>
+      <p class="muted">See who's low on charge, line up for the office charger, and get pinged when it's your turn.</p>
+
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-auth="login" type="button">Log in</button>
+        <button class="tab" data-auth="register" type="button">Register</button>
+      </div>
+
+      <form id="login-form" class="form">
+        <label>Email <input name="email" type="email" autocomplete="email" required /></label>
+        <label>Password <input name="password" type="password" autocomplete="current-password" required /></label>
+        <button type="submit">Log in</button>
+      </form>
+
+      <form id="register-form" class="form" hidden>
+        <label>Name <input name="name" autocomplete="name" required maxlength="60" /></label>
+        <label>Email <input name="email" type="email" autocomplete="email" required /></label>
+        <label>Password <input name="password" type="password" autocomplete="new-password" minlength="8" required /></label>
+        <label>Car model <input name="car_model" placeholder="e.g. Tesla Model 3" required maxlength="60" /></label>
+        <div class="row">
+          <label>Full-charge range (mi) <input name="full_range_mi" type="number" min="10" max="1000" value="250" required /></label>
+          <label>Current charge (%) <input name="charge_level" type="number" min="0" max="100" value="50" required /></label>
+        </div>
+        <label>Miles you drive per day <input name="daily_miles" type="number" min="0" max="1000" value="30" required /></label>
+        <button type="submit">Create account</button>
+      </form>
+      <p id="auth-error" class="error" role="alert"></p>
+    </section>
+  </main>
+
+  <!-- ===== App ===== -->
+  <main id="app-view" hidden>
+    <nav class="tabs main-tabs" role="tablist">
+      <button class="tab active" data-view="community" type="button">Community</button>
+      <button class="tab" data-view="usage" type="button">Charger usage</button>
+    </nav>
+
+    <section id="view-community" class="grid">
+      <div class="col-main">
+        <!-- Charger -->
+        <article class="card charger" id="charger-card">
+          <div class="charger-head">
+            <h2>Office charger</h2>
+            <span id="charger-status" class="badge"></span>
+          </div>
+          <div id="charger-body"></div>
+          <div id="charger-actions" class="actions"></div>
+          <p id="charger-error" class="error" role="alert"></p>
+        </article>
+
+        <!-- Queue -->
+        <article class="card">
+          <h2>Queue <span id="queue-count" class="muted small-text"></span></h2>
+          <ol id="queue-list" class="queue"></ol>
+        </article>
+
+        <!-- Drivers -->
+        <article class="card">
+          <div class="charger-head">
+            <h2>Drivers</h2>
+            <span class="muted small-text">Sorted by who'll run out first</span>
+          </div>
+          <div id="drivers" class="drivers"></div>
+        </article>
+      </div>
+
+      <aside class="col-side">
+        <!-- My status -->
+        <article class="card">
+          <h2>My car</h2>
+          <form id="status-form" class="form">
+            <label>Charge level: <strong><output id="charge-out">50</output>%</strong>
+              <input name="charge_level" id="charge-range" type="range" min="0" max="100" step="1" />
+            </label>
+            <div class="row">
+              <label>Miles / day <input name="daily_miles" type="number" min="0" max="1000" step="1" required /></label>
+              <label>Full range (mi) <input name="full_range_mi" type="number" min="10" max="1000" step="1" required /></label>
+            </div>
+            <label>Car model <input name="car_model" maxlength="60" required /></label>
+            <button type="submit">Update my status</button>
+            <p id="status-msg" class="muted small-text" role="status"></p>
+          </form>
+        </article>
+
+        <!-- Broadcast + feed -->
+        <article class="card">
+          <h2>Community feed</h2>
+          <form id="broadcast-form" class="broadcast">
+            <input name="message" maxlength="280" placeholder="Broadcast a message…" required />
+            <button type="submit">Send</button>
+          </form>
+          <ul id="feed" class="feed"></ul>
+        </article>
+      </aside>
+    </section>
+
+    <section id="view-usage" hidden>
+      <div class="usage-head">
+        <h2>Charger usage</h2>
+        <div class="seg" role="group" aria-label="Time range">
+          <button type="button" data-days="7">7 days</button>
+          <button type="button" data-days="30" class="active">30 days</button>
+          <button type="button" data-days="90">90 days</button>
+        </div>
+      </div>
+      <div id="usage-tiles" class="tiles"></div>
+      <div class="grid usage-grid">
+        <article class="card">
+          <h3>Hours charged per day</h3>
+          <div id="chart-daily" class="bars"></div>
+        </article>
+        <article class="card">
+          <h3>Busiest hours of the day <span class="muted small-text">(total hours in use)</span></h3>
+          <div id="chart-hourly" class="bars"></div>
+        </article>
+      </div>
+      <article class="card">
+        <h3>By driver</h3>
+        <div class="table-wrap"><table id="driver-table"></table></div>
+      </article>
+    </section>
+  </main>
+
+  <div id="tooltip" class="tooltip" hidden></div>
+  <div id="toast" class="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>

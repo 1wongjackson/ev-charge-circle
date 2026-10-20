@@ -1,0 +1,17 @@
+{
+  "name": "ev-charge-circle",
+  "version": "1.0.0",
+  "description": "Community app for office EV drivers sharing one charger",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch server.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "express": "^5.3.0"
+  }
+}
