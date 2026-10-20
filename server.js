@@ -126,13 +126,12 @@ function carColor(value, fallback) {
 
 // Charger/queue changes read-then-write shared state, so run them one at a time.
 let chargerLock = Promise.resolve();
-function serialized(handler) {
-  return (req, res) => {
-    const run = chargerLock.then(() => handler(req, res));
-    chargerLock = run.catch(() => {});
-    return run;
-  };
+function withChargerLock(fn) {
+  const run = chargerLock.then(fn);
+  chargerLock = run.catch(() => {});
+  return run;
 }
+const serialized = (handler) => (req, res) => withChargerLock(() => handler(req, res));
 
 // ---------- auth middleware ----------
 
@@ -549,11 +548,27 @@ app.use((err, req, res, next) => {
 setInterval(async () => {
   try {
     // Nudge the driver (and everyone waiting) when the promised end time passes.
-    const active = await activeSession();
-    if (active && !active.overdue_notified && active.expected_end < nowIso()) {
-      await all('UPDATE charge_sessions SET overdue_notified = TRUE WHERE id = $1', [active.id]);
-      await logEvent('overdue', null, { expected_end: active.expected_end }, active.user_id);
-    }
+    // One conditional update, so an end or extend racing this can't be clobbered.
+    const overdue = await one(
+      `UPDATE charge_sessions SET overdue_notified = TRUE
+       WHERE ended_at IS NULL AND NOT overdue_notified AND expected_end < $1
+       RETURNING user_id, expected_end`,
+      [nowIso()]
+    );
+    if (overdue) await logEvent('overdue', null, { expected_end: overdue.expected_end }, overdue.user_id);
+
+    // If the head of the queue let their hold lapse, drop them so the charger
+    // passes to the next driver instead of sitting idle.
+    await withChargerLock(async () => {
+      const reservedFor = Number(await getMeta('reserved_for'));
+      const reservedUntil = await getMeta('reserved_until');
+      if (!reservedFor || !reservedUntil || reservedUntil >= nowIso() || (await activeSession())) return;
+      const [head] = await queueRows();
+      if (head?.user_id !== reservedFor) return;
+      await all('DELETE FROM queue WHERE user_id = $1', [reservedFor]);
+      await logEvent('queue_skipped', null, { until: reservedUntil }, reservedFor);
+      await refreshReservation();
+    });
     await all('DELETE FROM sessions WHERE expires_at < $1', [nowIso()]);
   } catch (err) {
     console.error('Background job failed', err);

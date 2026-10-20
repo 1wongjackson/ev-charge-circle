@@ -230,6 +230,8 @@ function connectStream() {
     const me = state?.me;
     if (me && ev.target_user_id === me.id && ev.type === 'your_turn') {
       notify(`⚡ It's your turn! The charger is held for you until ${fmtTime(ev.data.until)}.`);
+    } else if (me && ev.target_user_id === me.id && ev.type === 'queue_skipped') {
+      notify("⌛ Your hold on the charger expired, so you've been taken out of the queue. Rejoin any time.");
     } else if (me && ev.target_user_id === me.id && ev.type === 'overdue') {
       notify('⏰ Your charge time is up — please move your car or update your finish time.');
     } else if (me && ev.user_id !== me.id && ev.type === 'message') {
@@ -600,6 +602,7 @@ function eventText(ev) {
     case 'queue_join': return `🙋 ${a} joined the queue${d.note ? `: “${esc(d.note)}”` : ''}`;
     case 'queue_leave': return `${a} left the queue`;
     case 'your_turn': return `➡️ Charger passed to ${t} — held until ${fmtTime(d.until)}`;
+    case 'queue_skipped': return `⌛ ${t}'s hold expired — removed from the queue`;
     case 'overdue': return `<span class="alert">⏰ ${t}'s charge was due at ${fmtTime(d.expected_end)}</span>`;
     case 'photo': return `📷 ${a} added a photo of their ${esc(d.car_model)}`;
     case 'message': return `💬 ${a}<br><span class="msg">${esc(d.message)}</span>`;
