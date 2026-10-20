@@ -10,7 +10,8 @@ const RETRY_NOT_FOUND_MS = 7 * 24 * 3600_000;
 const RETRY_ERROR_MS = 10 * 60_000;
 // The article's short description must say it's a vehicle, so "my old leaf"
 // doesn't come back with a photo of a fern.
-const VEHICLE = /\b(car|vehicle|automobile|suv|crossover|pickup|truck|hatchback|sedan|saloon|minivan|van|roadster|coupe|estate)s?\b/i;
+const VEHICLE =
+  /\b(car|vehicle|automobile|suv|crossover|pickup|truck|hatchback|sedan|saloon|minivan|van|roadster|coupe|estate)s?\b/i;
 
 await all(`
   CREATE TABLE IF NOT EXISTS car_images (
@@ -23,7 +24,11 @@ await all(`
     fetched_at TEXT NOT NULL
   )`);
 
-export const modelKey = (model) => String(model || '').trim().toLowerCase().replace(/\s+/g, ' ');
+export const modelKey = (model) =>
+  String(model || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
 
 const inFlight = new Map();
 const lastError = new Map();
@@ -34,18 +39,22 @@ async function wiki(query) {
   return res.json();
 }
 
-const stripHtml = (s) => String(s || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+const stripHtml = (s) =>
+  String(s || '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 
 async function lookup(model) {
   const search = await wiki(
-    `action=query&generator=search&gsrsearch=${encodeURIComponent(model)}&gsrlimit=5&gsrnamespace=0&prop=pageimages|description&piprop=name`
+    `action=query&generator=search&gsrsearch=${encodeURIComponent(model)}&gsrlimit=5&gsrnamespace=0&prop=pageimages|description&piprop=name`,
   );
   const pages = (search.query?.pages || []).sort((a, b) => a.index - b.index);
   const page = pages.find((p) => p.pageimage && !/\.svg$/i.test(p.pageimage) && VEHICLE.test(p.description || ''));
   if (!page) return null;
 
   const file = await wiki(
-    `action=query&titles=${encodeURIComponent('File:' + page.pageimage)}&prop=imageinfo&iiprop=url|extmetadata&iiurlwidth=320`
+    `action=query&titles=${encodeURIComponent('File:' + page.pageimage)}&prop=imageinfo&iiprop=url|extmetadata&iiurlwidth=320`,
   );
   const info = file.query?.pages?.[0]?.imageinfo?.[0];
   if (!info?.thumburl) return null;
@@ -74,7 +83,15 @@ export function resolveCarImage(model) {
          VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (model_key) DO UPDATE SET title = excluded.title, image_url = excluded.image_url,
            file_url = excluded.file_url, artist = excluded.artist, license = excluded.license, fetched_at = excluded.fetched_at`,
-        [key, found?.title ?? null, found?.image_url ?? null, found?.file_url ?? null, found?.artist ?? null, found?.license ?? null, new Date().toISOString()]
+        [
+          key,
+          found?.title ?? null,
+          found?.image_url ?? null,
+          found?.file_url ?? null,
+          found?.artist ?? null,
+          found?.license ?? null,
+          new Date().toISOString(),
+        ],
       );
       return Boolean(found);
     } catch (err) {
@@ -107,9 +124,11 @@ export async function carImagesFor(models, onFound) {
     if (!row || stale) pending.push(resolveCarImage(model));
     result.set(
       modelKey(model),
-      !row ? undefined
-        : row.image_url ? { url: row.image_url, file_url: row.file_url, title: row.title, artist: row.artist, license: row.license }
-        : null
+      !row
+        ? undefined
+        : row.image_url
+          ? { url: row.image_url, file_url: row.file_url, title: row.title, artist: row.artist, license: row.license }
+          : null,
     );
   }
   if (pending.length && onFound) {

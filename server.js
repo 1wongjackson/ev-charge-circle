@@ -58,7 +58,7 @@ function parseCookies(req) {
 function setSessionCookie(res, token, maxAgeSec) {
   res.setHeader(
     'Set-Cookie',
-    `sid=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAgeSec}${COOKIE_SECURE ? '; Secure' : ''}`
+    `sid=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAgeSec}${COOKIE_SECURE ? '; Secure' : ''}`,
   );
 }
 
@@ -129,8 +129,23 @@ function publicUser(u) {
 
 // Every users column except the photo itself, which is only read by the photo route.
 const userCols = (p = '') =>
-  ['id', 'name', 'email', 'password_hash', 'car_model', 'full_range_mi', 'charge_level', 'daily_miles',
-   'units', 'car_color', 'car_photo_at', 'updated_at', 'created_at'].map((c) => p + c).join(', ');
+  [
+    'id',
+    'name',
+    'email',
+    'password_hash',
+    'car_model',
+    'full_range_mi',
+    'charge_level',
+    'daily_miles',
+    'units',
+    'car_color',
+    'car_photo_at',
+    'updated_at',
+    'created_at',
+  ]
+    .map((c) => p + c)
+    .join(', ');
 
 const CAR_COLORS = ['#f4f5f2', '#1f2224', '#c3c8cc', '#6c757b', '#2f5fb3', '#c0392b', '#2e7d5b', '#e3b23c', '#e07a2e'];
 function carColor(value, fallback) {
@@ -157,7 +172,7 @@ async function auth(req, res, next) {
     (await one(
       `SELECT ${userCols('u.')} FROM sessions s JOIN users u ON u.id = s.user_id
        WHERE s.token_hash = $1 AND s.expires_at > $2`,
-      [sha256(token), nowIso()]
+      [sha256(token), nowIso()],
     ));
   if (!user) throw new HttpError(401, 'Please log in');
   req.user = user;
@@ -213,7 +228,7 @@ const formatEvent = (e) => ({ ...e, data: JSON.parse(e.data) });
 async function logEvent(type, userId, data = {}, targetUserId = null) {
   const { id } = await one(
     'INSERT INTO events(type, user_id, target_user_id, data, created_at) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-    [type, userId, targetUserId, JSON.stringify(data), nowIso()]
+    [type, userId, targetUserId, JSON.stringify(data), nowIso()],
   );
   const event = formatEvent(await one(`${eventSelect} WHERE e.id = $1`, [id]));
   const payload = `data: ${JSON.stringify(event)}\n\n`;
@@ -233,7 +248,7 @@ const prefetchCarImage = (model) => resolveCarImage(model).then((found) => found
 const activeSession = () =>
   one(
     `SELECT c.*, u.name, u.car_model FROM charge_sessions c
-     JOIN users u ON u.id = c.user_id WHERE c.ended_at IS NULL`
+     JOIN users u ON u.id = c.user_id WHERE c.ended_at IS NULL`,
   );
 
 const queueRows = () =>
@@ -241,7 +256,7 @@ const queueRows = () =>
     `SELECT q.user_id, q.joined_at, q.note, u.name, u.car_model, u.charge_level,
             u.daily_miles, u.full_range_mi
      FROM queue q JOIN users u ON u.id = q.user_id
-     ORDER BY q.joined_at, q.user_id`
+     ORDER BY q.joined_at, q.user_id`,
   );
 
 // When the charger is free and someone is waiting, hold it for the head of the
@@ -326,7 +341,7 @@ app.post('/api/register', async (req, res) => {
     `INSERT INTO users(name, email, password_hash, car_model, full_range_mi, charge_level, daily_miles, units, updated_at, created_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      ON CONFLICT (email) DO NOTHING RETURNING id`,
-    [name, email, await hashPassword(password), carModel, fullRange, charge, daily, unitPref, now, now]
+    [name, email, await hashPassword(password), carModel, fullRange, charge, daily, unitPref, now, now],
   );
   if (!created) throw new HttpError(409, 'An account with that email already exists');
   await startSession(res, created.id);
@@ -336,7 +351,10 @@ app.post('/api/register', async (req, res) => {
 });
 
 app.post('/api/login', async (req, res) => {
-  const email = String(req.body?.email || '').trim().toLowerCase().slice(0, 120);
+  const email = String(req.body?.email || '')
+    .trim()
+    .toLowerCase()
+    .slice(0, 120);
   const password = String(req.body?.password || '');
   failedLoginsByIp.check(req.ip);
   failedLoginsByEmail.check(email);
@@ -364,7 +382,10 @@ app.post('/api/logout', async (req, res) => {
 
 /** publicUser plus the cached stock photo of each user's car model. */
 async function withCarImages(users) {
-  const images = await carImagesFor(users.map((u) => u.car_model), broadcastRefresh);
+  const images = await carImagesFor(
+    users.map((u) => u.car_model),
+    broadcastRefresh,
+  );
   return users.map((u) => {
     const image = images.get(modelKey(u.car_model));
     return { ...publicUser(u), car_image: image ?? null, car_image_pending: image === undefined };
@@ -395,7 +416,7 @@ app.get('/api/users/:id/profile', auth, async (req, res) => {
   const sessions = await all(
     `SELECT started_at, expected_end, ended_at, start_level, end_level FROM charge_sessions
      WHERE user_id = $1 ORDER BY started_at DESC LIMIT 2000`,
-    [id]
+    [id],
   );
   const now = Date.now();
   const monthAgo = now - 30 * 24 * 3600_000;
@@ -423,7 +444,12 @@ app.get('/api/users/:id/profile', auth, async (req, res) => {
       : charger.reservation?.user_id === id
         ? { state: 'reserved', until: charger.reservation.until }
         : queueIndex >= 0
-          ? { state: 'queued', position: queueIndex + 1, note: charger.queue[queueIndex].note, joined_at: charger.queue[queueIndex].joined_at }
+          ? {
+              state: 'queued',
+              position: queueIndex + 1,
+              note: charger.queue[queueIndex].note,
+              joined_at: charger.queue[queueIndex].joined_at,
+            }
           : { state: 'idle' };
 
   const events = (
@@ -454,7 +480,7 @@ app.put('/api/me', auth, async (req, res) => {
   const color = carColor(b.car_color, u.car_color);
   await all(
     'UPDATE users SET charge_level = $1, daily_miles = $2, full_range_mi = $3, car_model = $4, car_color = $5, updated_at = $6 WHERE id = $7',
-    [charge, daily, fullRange, carModel, color, nowIso(), u.id]
+    [charge, daily, fullRange, carModel, color, nowIso(), u.id],
   );
   await logEvent('status', u.id, { charge_level: charge, daily_miles: daily });
   if (carModel !== u.car_model) prefetchCarImage(carModel);
@@ -494,18 +520,22 @@ app.put('/api/me/preferences', auth, async (req, res) => {
 
 // Deletes the account and everything tied to it: charging history, queue spot,
 // sessions, and every feed event by or about this driver.
-app.delete('/api/me', auth, serialized(async (req, res) => {
-  const stored = await one('SELECT password_hash FROM users WHERE id = $1', [req.user.id]);
-  if (!(await verifyPassword(String(req.body?.password || ''), stored?.password_hash))) {
-    throw new HttpError(403, 'Wrong password');
-  }
-  await all('DELETE FROM events WHERE user_id = $1 OR target_user_id = $1', [req.user.id]);
-  await all('DELETE FROM users WHERE id = $1', [req.user.id]); // cascades sessions, charging history, queue
-  await refreshReservation();
-  broadcastRefresh();
-  setSessionCookie(res, '', 0);
-  res.json({ ok: true });
-}));
+app.delete(
+  '/api/me',
+  auth,
+  serialized(async (req, res) => {
+    const stored = await one('SELECT password_hash FROM users WHERE id = $1', [req.user.id]);
+    if (!(await verifyPassword(String(req.body?.password || ''), stored?.password_hash))) {
+      throw new HttpError(403, 'Wrong password');
+    }
+    await all('DELETE FROM events WHERE user_id = $1 OR target_user_id = $1', [req.user.id]);
+    await all('DELETE FROM users WHERE id = $1', [req.user.id]); // cascades sessions, charging history, queue
+    await refreshReservation();
+    broadcastRefresh();
+    setSessionCookie(res, '', 0);
+    res.json({ ok: true });
+  }),
+);
 
 app.post('/api/broadcast', auth, async (req, res) => {
   const message = str(req.body?.message, 'Message', 280);
@@ -515,70 +545,96 @@ app.post('/api/broadcast', auth, async (req, res) => {
 
 // ---------- routes: the shared charger ----------
 
-app.post('/api/charger/start', auth, serialized(async (req, res) => {
-  const expectedEnd = futureTime(req.body?.expected_end);
-  const me = req.user;
-  if (await activeSession()) throw new HttpError(409, 'The charger is already in use');
-  const { reservation } = await chargerState();
-  if (reservation && reservation.user_id !== me.id) {
-    throw new HttpError(409, `The charger is reserved for ${reservation.name} (next in the queue) for a few more minutes`);
-  }
-  await all('INSERT INTO charge_sessions(user_id, started_at, expected_end, start_level) VALUES ($1, $2, $3, $4)', [
-    me.id,
-    nowIso(),
-    expectedEnd,
-    me.charge_level,
-  ]);
-  await all('DELETE FROM queue WHERE user_id = $1', [me.id]);
-  await logEvent('start', me.id, { expected_end: expectedEnd, charge_level: me.charge_level });
-  await refreshReservation();
-  res.json(await chargerState());
-}));
+app.post(
+  '/api/charger/start',
+  auth,
+  serialized(async (req, res) => {
+    const expectedEnd = futureTime(req.body?.expected_end);
+    const me = req.user;
+    if (await activeSession()) throw new HttpError(409, 'The charger is already in use');
+    const { reservation } = await chargerState();
+    if (reservation && reservation.user_id !== me.id) {
+      throw new HttpError(
+        409,
+        `The charger is reserved for ${reservation.name} (next in the queue) for a few more minutes`,
+      );
+    }
+    await all('INSERT INTO charge_sessions(user_id, started_at, expected_end, start_level) VALUES ($1, $2, $3, $4)', [
+      me.id,
+      nowIso(),
+      expectedEnd,
+      me.charge_level,
+    ]);
+    await all('DELETE FROM queue WHERE user_id = $1', [me.id]);
+    await logEvent('start', me.id, { expected_end: expectedEnd, charge_level: me.charge_level });
+    await refreshReservation();
+    res.json(await chargerState());
+  }),
+);
 
-app.post('/api/charger/update', auth, serialized(async (req, res) => {
-  const expectedEnd = futureTime(req.body?.expected_end);
-  const active = await activeSession();
-  if (!active || active.user_id !== req.user.id) throw new HttpError(403, "You're not the one charging right now");
-  await all('UPDATE charge_sessions SET expected_end = $1, overdue_notified = FALSE WHERE id = $2', [expectedEnd, active.id]);
-  await logEvent('extend', req.user.id, { expected_end: expectedEnd });
-  res.json(await chargerState());
-}));
+app.post(
+  '/api/charger/update',
+  auth,
+  serialized(async (req, res) => {
+    const expectedEnd = futureTime(req.body?.expected_end);
+    const active = await activeSession();
+    if (!active || active.user_id !== req.user.id) throw new HttpError(403, "You're not the one charging right now");
+    await all('UPDATE charge_sessions SET expected_end = $1, overdue_notified = FALSE WHERE id = $2', [
+      expectedEnd,
+      active.id,
+    ]);
+    await logEvent('extend', req.user.id, { expected_end: expectedEnd });
+    res.json(await chargerState());
+  }),
+);
 
-app.post('/api/charger/end', auth, serialized(async (req, res) => {
-  const active = await activeSession();
-  if (!active || active.user_id !== req.user.id) throw new HttpError(403, "You're not the one charging right now");
-  const endLevel = num(req.body?.end_level, 'Charge level', 0, 100, null);
-  const now = nowIso();
-  await all('UPDATE charge_sessions SET ended_at = $1, end_level = $2 WHERE id = $3', [now, endLevel, active.id]);
-  if (endLevel !== null) {
-    await all('UPDATE users SET charge_level = $1, updated_at = $2 WHERE id = $3', [endLevel, now, req.user.id]);
-  }
-  const minutes = Math.round((Date.parse(now) - Date.parse(active.started_at)) / 60_000);
-  await logEvent('end', req.user.id, { minutes, end_level: endLevel });
-  await refreshReservation();
-  res.json(await chargerState());
-}));
+app.post(
+  '/api/charger/end',
+  auth,
+  serialized(async (req, res) => {
+    const active = await activeSession();
+    if (!active || active.user_id !== req.user.id) throw new HttpError(403, "You're not the one charging right now");
+    const endLevel = num(req.body?.end_level, 'Charge level', 0, 100, null);
+    const now = nowIso();
+    await all('UPDATE charge_sessions SET ended_at = $1, end_level = $2 WHERE id = $3', [now, endLevel, active.id]);
+    if (endLevel !== null) {
+      await all('UPDATE users SET charge_level = $1, updated_at = $2 WHERE id = $3', [endLevel, now, req.user.id]);
+    }
+    const minutes = Math.round((Date.parse(now) - Date.parse(active.started_at)) / 60_000);
+    await logEvent('end', req.user.id, { minutes, end_level: endLevel });
+    await refreshReservation();
+    res.json(await chargerState());
+  }),
+);
 
-app.post('/api/queue/join', auth, serialized(async (req, res) => {
-  const note = str(req.body?.note, 'Note', 140, { optional: true });
-  if ((await activeSession())?.user_id === req.user.id) throw new HttpError(409, "You're already charging");
-  const joined = await one(
-    'INSERT INTO queue(user_id, joined_at, note) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO NOTHING RETURNING user_id',
-    [req.user.id, nowIso(), note]
-  );
-  if (!joined) throw new HttpError(409, "You're already in the queue");
-  await logEvent('queue_join', req.user.id, { note });
-  await refreshReservation();
-  res.json(await chargerState());
-}));
+app.post(
+  '/api/queue/join',
+  auth,
+  serialized(async (req, res) => {
+    const note = str(req.body?.note, 'Note', 140, { optional: true });
+    if ((await activeSession())?.user_id === req.user.id) throw new HttpError(409, "You're already charging");
+    const joined = await one(
+      'INSERT INTO queue(user_id, joined_at, note) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO NOTHING RETURNING user_id',
+      [req.user.id, nowIso(), note],
+    );
+    if (!joined) throw new HttpError(409, "You're already in the queue");
+    await logEvent('queue_join', req.user.id, { note });
+    await refreshReservation();
+    res.json(await chargerState());
+  }),
+);
 
-app.post('/api/queue/leave', auth, serialized(async (req, res) => {
-  const left = await one('DELETE FROM queue WHERE user_id = $1 RETURNING user_id', [req.user.id]);
-  if (!left) throw new HttpError(409, "You're not in the queue");
-  await logEvent('queue_leave', req.user.id);
-  await refreshReservation();
-  res.json(await chargerState());
-}));
+app.post(
+  '/api/queue/leave',
+  auth,
+  serialized(async (req, res) => {
+    const left = await one('DELETE FROM queue WHERE user_id = $1 RETURNING user_id', [req.user.id]);
+    if (!left) throw new HttpError(409, "You're not in the queue");
+    await logEvent('queue_leave', req.user.id);
+    await refreshReservation();
+    res.json(await chargerState());
+  }),
+);
 
 // Charging history for the usage view. Charts are bucketed client-side so days
 // and hours land in the viewer's local time zone. Timestamps say when people
@@ -593,14 +649,21 @@ app.get('/api/sessions', auth, async (req, res) => {
     `SELECT c.user_id, u.name, c.started_at, c.expected_end, c.ended_at
      FROM charge_sessions c JOIN users u ON u.id = c.user_id
      WHERE COALESCE(c.ended_at, '9999') >= $1 ORDER BY c.started_at`,
-    [since]
+    [since],
   );
 
   const drivers = new Map();
   for (const c of rows) {
     const ms = (c.ended_at ? Date.parse(c.ended_at) : now) - Math.max(Date.parse(c.started_at), Date.parse(since));
     const late = Boolean(c.ended_at) && Date.parse(c.ended_at) > Date.parse(c.expected_end) + ON_TIME_GRACE_MS;
-    const d = drivers.get(c.user_id) || { user_id: c.user_id, name: c.name, count: 0, ms: 0, late: 0, last: c.started_at };
+    const d = drivers.get(c.user_id) || {
+      user_id: c.user_id,
+      name: c.name,
+      count: 0,
+      ms: 0,
+      late: 0,
+      last: c.started_at,
+    };
     d.count++;
     d.ms += Math.max(0, ms);
     if (late) d.late++;
@@ -630,7 +693,7 @@ app.get('/api/stream', auth, (req, res) => {
 
 app.use('/api', (req, res, next) => next(new HttpError(404, 'Not found')));
 
-app.use((err, req, res, next) => {
+app.use((err, req, res, _next) => {
   const status = err.status || (err.type === 'entity.parse.failed' ? 400 : 500);
   if (status >= 500) console.error(err);
   res.status(status).json({ error: status >= 500 ? 'Something went wrong' : err.message });
@@ -646,7 +709,7 @@ setInterval(async () => {
       `UPDATE charge_sessions SET overdue_notified = TRUE
        WHERE ended_at IS NULL AND NOT overdue_notified AND expected_end < $1
        RETURNING user_id, expected_end`,
-      [nowIso()]
+      [nowIso()],
     );
     if (overdue) await logEvent('overdue', null, { expected_end: overdue.expected_end }, overdue.user_id);
 

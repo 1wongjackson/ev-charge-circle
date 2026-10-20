@@ -27,6 +27,16 @@ npm start
 
 Then open http://localhost:3000.
 
+### Lint and format
+
+```bash
+npm run lint     # ESLint
+npm run format   # Prettier: rewrite JS, JSON, YAML and Markdown
+npm run check    # both, without changing files (what CI runs on every push and pull request)
+```
+
+CSS and HTML are formatted by hand and skipped by Prettier.
+
 ## Demo data
 
 `npm run seed:demo` adds six demo drivers (`@example.com` emails) to the local database. It also adds three weeks of charging history, a driver charging right now, two drivers in the queue, and feed activity. The demo drivers use a mix of miles and kilometres. They share one password, which is random on each run and printed at the end (set `DEMO_PASSWORD` to choose it).
@@ -51,15 +61,15 @@ The free Render plan sleeps after about 15 minutes without traffic. The first vi
 
 ### Configuration (environment variables)
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `PORT` | `3000` | HTTP port |
-| `DATABASE_URL` | — | Postgres connection string (production) |
-| `PGLITE_DIR` | `data/pglite` | Local embedded database folder, used when `DATABASE_URL` is unset |
-| `RESERVE_MINUTES` | `15` | How long the charger is held for the next driver in the queue |
-| `NODE_ENV` | — | Set to `production` to mark cookies `Secure` (requires HTTPS) |
-| `ALLOWED_EMAIL_DOMAINS` | — | Comma-separated email domains allowed to sign up, e.g. `acme.com,acme.co.uk`. Unset = any domain |
-| `SIGNUP_CODE` | — | Invite code required to sign up. Unset = no code |
+| Variable                | Default       | Meaning                                                                                          |
+| ----------------------- | ------------- | ------------------------------------------------------------------------------------------------ |
+| `PORT`                  | `3000`        | HTTP port                                                                                        |
+| `DATABASE_URL`          | —             | Postgres connection string (production)                                                          |
+| `PGLITE_DIR`            | `data/pglite` | Local embedded database folder, used when `DATABASE_URL` is unset                                |
+| `RESERVE_MINUTES`       | `15`          | How long the charger is held for the next driver in the queue                                    |
+| `NODE_ENV`              | —             | Set to `production` to mark cookies `Secure` (requires HTTPS)                                    |
+| `ALLOWED_EMAIL_DOMAINS` | —             | Comma-separated email domains allowed to sign up, e.g. `acme.com,acme.co.uk`. Unset = any domain |
+| `SIGNUP_CODE`           | —             | Invite code required to sign up. Unset = no code                                                 |
 
 ## Structure
 

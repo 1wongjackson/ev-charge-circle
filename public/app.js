@@ -1,4 +1,5 @@
 'use strict';
+/* global CAR_COLORS, carThumb, defaultCarColor, resizeCarPhoto -- from cars.js, loaded first */
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
@@ -7,6 +8,9 @@ let state = null; // latest /api/state payload
 let stream = null;
 let statusDirty = false;
 let usageDays = 30;
+let profileId = null; // driver whose profile is open
+let retryTimer; // pending live-feed reconnect
+let retryDelay = 2000;
 
 // ---------- units ----------
 // Distances are stored in miles; 'metric' only changes what's shown and typed.
@@ -19,7 +23,9 @@ function guessUnits() {
   try {
     const saved = localStorage.getItem('units');
     if (saved === 'imperial' || saved === 'metric') return saved;
-  } catch {}
+  } catch {
+    // storage blocked (e.g. private mode): fall back to the locale
+  }
   const region = (navigator.language || '').split('-')[1]?.toUpperCase();
   return IMPERIAL_REGIONS.includes(region) ? 'imperial' : 'metric';
 }
@@ -31,7 +37,11 @@ const showDist = (mi) => Math.round(units === 'metric' ? mi * KM_PER_MI : mi);
 const inputToMiles = (v) => (v === '' || v == null ? v : units === 'metric' ? Number(v) / KM_PER_MI : Number(v));
 
 function applyUnits() {
-  try { localStorage.setItem('units', units); } catch {}
+  try {
+    localStorage.setItem('units', units);
+  } catch {
+    // storage blocked: the choice still lasts for this page
+  }
   $$('.u-dist').forEach((el) => (el.textContent = distUnit()));
   $$('[data-units], [data-reg-units]').forEach((b) => setPressed(b, (b.dataset.units || b.dataset.regUnits) === units));
   // Server limits are 1000 mi; keep the input limits equivalent.
@@ -51,7 +61,10 @@ function convertDistInputs(form, from, to) {
 // ---------- utilities ----------
 
 function esc(s) {
-  return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+  return String(s ?? '').replace(
+    /[&<>"']/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c],
+  );
 }
 
 async function api(url, { method = 'GET', body } = {}) {
@@ -171,7 +184,7 @@ $$('[data-auth]').forEach((btn) =>
     $('#login-form').hidden = btn.dataset.auth !== 'login';
     $('#register-form').hidden = btn.dataset.auth !== 'register';
     $('#auth-error').textContent = '';
-  })
+  }),
 );
 
 async function submitAuth(e, url) {
@@ -184,7 +197,9 @@ async function submitAuth(e, url) {
     body.units = units;
   }
   try {
-    await whileBusy([e.submitter || e.target.querySelector('[type="submit"]')], () => api(url, { method: 'POST', body }));
+    await whileBusy([e.submitter || e.target.querySelector('[type="submit"]')], () =>
+      api(url, { method: 'POST', body }),
+    );
     e.target.reset();
     await boot();
   } catch (err) {
@@ -196,7 +211,7 @@ $$('[data-reg-units]').forEach((btn) =>
     convertDistInputs($('#register-form'), units, btn.dataset.regUnits);
     units = btn.dataset.regUnits;
     applyUnits();
-  })
+  }),
 );
 
 $$('[data-units]').forEach((btn) =>
@@ -208,7 +223,7 @@ $$('[data-units]').forEach((btn) =>
     render();
     if (!$('#view-usage').hidden) loadUsage();
     await api('/api/me/preferences', { method: 'PUT', body: { units } }).catch((err) => toast(err.message));
-  })
+  }),
 );
 
 // Ask for an invite code / work email only when the server requires one.
@@ -258,7 +273,9 @@ async function boot() {
 }
 
 // Shown whenever the live feed or a refresh fails, so nobody acts on stale data.
-const setOffline = (offline) => ($('#conn-banner').hidden = !offline);
+function setOffline(offline) {
+  $('#conn-banner').hidden = !offline;
+}
 
 async function reload() {
   try {
@@ -283,8 +300,6 @@ const scheduleReload = () => {
 // EventSource retries on its own after a dropped connection, but gives up for
 // good on an error response (e.g. a 502 while the server restarts). Then we
 // retry ourselves, backing off, via /api/state, which also catches a 401.
-let retryTimer;
-let retryDelay = 2000;
 
 function retryStream() {
   clearTimeout(retryTimer);
@@ -391,10 +406,14 @@ function renderCharger() {
   const pill = $('#charger-pill');
   pill.className = `pill ${mode}`;
   pill.textContent =
-    mode === 'free' ? '● Charger free' : mode === 'reserved' ? `● Held for ${reservation.name}` : `● ${active.name} charging`;
+    mode === 'free'
+      ? '● Charger free'
+      : mode === 'reserved'
+        ? `● Held for ${reservation.name}`
+        : `● ${active.name} charging`;
 
-  let body = '';
-  let actions = '';
+  let body;
+  let actions;
 
   if (active) {
     const start = Date.parse(active.started_at);
@@ -448,7 +467,10 @@ function renderCharger() {
   $('#charger-body').innerHTML = body;
   // Don't wipe inputs the user is typing into on periodic re-renders.
   const actionsEl = $('#charger-actions');
-  if (actionsEl.dataset.key !== `${mode}|${active?.user_id}|${reservation?.user_id}|${inQueue}` || !actionsEl.contains(document.activeElement)) {
+  if (
+    actionsEl.dataset.key !== `${mode}|${active?.user_id}|${reservation?.user_id}|${inQueue}` ||
+    !actionsEl.contains(document.activeElement)
+  ) {
     actionsEl.innerHTML = actions;
     actionsEl.dataset.key = `${mode}|${active?.user_id}|${reservation?.user_id}|${inQueue}`;
   }
@@ -519,7 +541,7 @@ function renderQueue() {
           ${q.note ? `<div class="note">“${esc(q.note)}”</div>` : ''}
         </div>
         ${reservation?.user_id === q.user_id ? '<span class="badge reserved">Up now</span>' : ''}
-      </li>`
+      </li>`,
         )
         .join('')
     : '<li class="empty">Nobody waiting.</li>';
@@ -605,7 +627,8 @@ function renderMyCar() {
 }
 
 $('#color-swatches').innerHTML = CAR_COLORS.map(
-  (c) => `<button type="button" class="swatch" role="radio" data-color="${c.hex}" style="background:${c.hex}" title="${c.name}" aria-label="${c.name}"></button>`
+  (c) =>
+    `<button type="button" class="swatch" role="radio" data-color="${c.hex}" style="background:${c.hex}" title="${c.name}" aria-label="${c.name}"></button>`,
 ).join('');
 
 $('#color-swatches').addEventListener('click', (e) => {
@@ -685,7 +708,7 @@ $('#broadcast-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   try {
     await whileBusy([e.target.querySelector('button')], () =>
-      api('/api/broadcast', { method: 'POST', body: { message: e.target.message.value } })
+      api('/api/broadcast', { method: 'POST', body: { message: e.target.message.value } }),
     );
     e.target.reset();
   } catch (err) {
@@ -698,19 +721,32 @@ function eventText(ev) {
   const t = ev.target_user_id ? nameLink(ev.target_user_id, ev.target) : '<strong>Someone</strong>';
   const d = ev.data || {};
   switch (ev.type) {
-    case 'registered': return `👋 ${a} joined the community (${esc(d.car_model)})`;
-    case 'status': return `🔋 ${a} is at ${d.charge_level}%, driving ${showDist(d.daily_miles)} ${distUnit()}/day`;
-    case 'start': return `⚡ ${a} plugged in — expects to be done at <strong>${fmtTime(d.expected_end)}</strong>`;
-    case 'extend': return `🕒 ${a} now expects to be done at <strong>${fmtTime(d.expected_end)}</strong>`;
-    case 'end': return `✅ ${a} unplugged after ${fmtDuration(d.minutes)}${d.end_level != null ? ` at ${d.end_level}%` : ''} — charger is free`;
-    case 'queue_join': return `🙋 ${a} joined the queue${d.note ? `: “${esc(d.note)}”` : ''}`;
-    case 'queue_leave': return `${a} left the queue`;
-    case 'your_turn': return `➡️ Charger passed to ${t} — held until ${fmtTime(d.until)}`;
-    case 'queue_skipped': return `⌛ ${t}'s hold expired — removed from the queue`;
-    case 'overdue': return `<span class="alert">⏰ ${t}'s charge was due at ${fmtTime(d.expected_end)}</span>`;
-    case 'photo': return `📷 ${a} added a photo of their ${esc(d.car_model)}`;
-    case 'message': return `💬 ${a}<br><span class="msg">${esc(d.message)}</span>`;
-    default: return esc(ev.type);
+    case 'registered':
+      return `👋 ${a} joined the community (${esc(d.car_model)})`;
+    case 'status':
+      return `🔋 ${a} is at ${d.charge_level}%, driving ${showDist(d.daily_miles)} ${distUnit()}/day`;
+    case 'start':
+      return `⚡ ${a} plugged in — expects to be done at <strong>${fmtTime(d.expected_end)}</strong>`;
+    case 'extend':
+      return `🕒 ${a} now expects to be done at <strong>${fmtTime(d.expected_end)}</strong>`;
+    case 'end':
+      return `✅ ${a} unplugged after ${fmtDuration(d.minutes)}${d.end_level != null ? ` at ${d.end_level}%` : ''} — charger is free`;
+    case 'queue_join':
+      return `🙋 ${a} joined the queue${d.note ? `: “${esc(d.note)}”` : ''}`;
+    case 'queue_leave':
+      return `${a} left the queue`;
+    case 'your_turn':
+      return `➡️ Charger passed to ${t} — held until ${fmtTime(d.until)}`;
+    case 'queue_skipped':
+      return `⌛ ${t}'s hold expired — removed from the queue`;
+    case 'overdue':
+      return `<span class="alert">⏰ ${t}'s charge was due at ${fmtTime(d.expected_end)}</span>`;
+    case 'photo':
+      return `📷 ${a} added a photo of their ${esc(d.car_model)}`;
+    case 'message':
+      return `💬 ${a}<br><span class="msg">${esc(d.message)}</span>`;
+    default:
+      return esc(ev.type);
   }
 }
 
@@ -750,9 +786,10 @@ window.addEventListener('hashchange', () => state && route());
 $$('[data-view]').forEach((btn) =>
   btn.addEventListener('click', () => {
     lastTab = btn.dataset.view;
-    if (location.hash) location.hash = ''; // leaving a profile; route() shows the tab
+    if (location.hash)
+      location.hash = ''; // leaving a profile; route() shows the tab
     else showView(lastTab);
-  })
+  }),
 );
 
 $('.back-link').addEventListener('click', (e) => {
@@ -762,8 +799,6 @@ $('.back-link').addEventListener('click', (e) => {
 
 // ---------- driver profile ----------
 
-let profileId = null;
-
 async function loadProfile(id) {
   const first = profileId !== id;
   profileId = id;
@@ -772,7 +807,8 @@ async function loadProfile(id) {
     const profile = await api(`/api/users/${id}/profile`);
     if (profileId === id) renderProfile(profile);
   } catch (err) {
-    if (profileId === id) $('#profile').innerHTML = `<article class="card"><p class="error">${esc(err.message)}</p></article>`;
+    if (profileId === id)
+      $('#profile').innerHTML = `<article class="card"><p class="error">${esc(err.message)}</p></article>`;
   }
 }
 
@@ -800,7 +836,11 @@ function sessionRow(s) {
   const time = `${shortTime(s.started_at)} – ${s.ended_at ? shortTime(s.ended_at) : 'now'}`;
   const charge = s.start_level != null ? `${s.start_level}% → ${s.end_level != null ? s.end_level + '%' : '…'}` : '—';
   const done =
-    s.on_time === null ? 'In progress' : s.on_time ? '<span class="ok">✓ On time</span>' : '<span class="late-text">Overstayed</span>';
+    s.on_time === null
+      ? 'In progress'
+      : s.on_time
+        ? '<span class="ok">✓ On time</span>'
+        : '<span class="late-text">Overstayed</span>';
   return `<tr><td>${date}</td><td>${time}</td><td class="num">${fmtDuration((end - Date.parse(s.started_at)) / 60000)}</td>
     <td>${charge}</td><td>${done}</td></tr>`;
 }
@@ -868,7 +908,8 @@ $$('[data-days]').forEach((btn) => btn.addEventListener('click', () => loadUsage
 
 const OFFICE_START = 8;
 const OFFICE_END = 18;
-const isOfficeHour = (d) => d.getDay() >= 1 && d.getDay() <= 5 && d.getHours() >= OFFICE_START && d.getHours() < OFFICE_END;
+const isOfficeHour = (d) =>
+  d.getDay() >= 1 && d.getDay() <= 5 && d.getHours() >= OFFICE_START && d.getHours() < OFFICE_END;
 const dayKey = (d) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 
 function nextHour(t) {
@@ -920,7 +961,7 @@ function renderUsage({ sessions, drivers }) {
     const start = Math.max(Date.parse(s.started_at), from);
     const end = s.ended_at ? Date.parse(s.ended_at) : now;
     if (end <= start) continue;
-    for (let t = start; t < end; ) {
+    for (let t = start; t < end;) {
       const next = Math.min(end, nextHour(t));
       const d = new Date(t);
       const slice = next - t;
@@ -936,7 +977,7 @@ function renderUsage({ sessions, drivers }) {
   }
 
   let officeAvailMs = 0;
-  for (let t = from; t < now; ) {
+  for (let t = from; t < now;) {
     const next = Math.min(now, nextHour(t));
     if (isOfficeHour(new Date(t))) officeAvailMs += next - t;
     t = next;
@@ -961,14 +1002,14 @@ function renderUsage({ sessions, drivers }) {
       value: hrs(d.ms),
       label: i % labelEvery === 0 ? d.date.toLocaleDateString([], { month: 'short', day: 'numeric' }) : '',
       tip: `${d.date.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}: ${hrs(d.ms).toFixed(1)} h`,
-    }))
+    })),
   );
   barChart(
     $('#chart-hourly'),
     hours.map(({ h, ms }) => {
       const label = new Date(2000, 0, 1, h).toLocaleTimeString([], { hour: 'numeric' });
       return { value: hrs(ms), label: h % 3 === 0 ? label : '', tip: `${label}: ${hrs(ms).toFixed(1)} h in use` };
-    })
+    }),
   );
 
   // Per-driver totals come from the server, since older sessions arrive without names.
@@ -994,8 +1035,11 @@ function barChart(el, data) {
     <div class="bars-max">max ${max < 0.01 ? 0 : max.toFixed(1)} h</div>
     <div class="bars-plot">${data
       .map(
-        (d, i) => `<div class="bar-slot" data-tip="${esc(d.tip)}" role="img" aria-label="${esc(d.tip)}" tabindex="${i === 0 ? 0 : -1}">
-          <div class="bar" style="height:${(d.value / max) * 100}%"></div></div>`
+        (
+          d,
+          i,
+        ) => `<div class="bar-slot" data-tip="${esc(d.tip)}" role="img" aria-label="${esc(d.tip)}" tabindex="${i === 0 ? 0 : -1}">
+          <div class="bar" style="height:${(d.value / max) * 100}%"></div></div>`,
       )
       .join('')}</div>
     <div class="bars-axis">${data.map((d) => `<span>${esc(d.label)}</span>`).join('')}</div>`;
