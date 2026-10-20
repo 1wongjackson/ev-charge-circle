@@ -42,7 +42,9 @@
       <form id="register-form" class="form" method="post" action="#" hidden>
         <label>Name <input name="name" autocomplete="name" required maxlength="60" /></label>
         <label>Email <input name="email" type="email" autocomplete="email" required /></label>
-        <label>Password <input name="password" type="password" autocomplete="new-password" minlength="8" required /></label>
+        <p id="work-email-hint" class="muted small-text field-hint" hidden>Use your work email address.</p>
+        <label>Password <input name="password" type="password" autocomplete="new-password" minlength="8" maxlength="128" required /></label>
+        <label id="invite-field" hidden>Invite code <input name="invite_code" autocomplete="off" /></label>
         <label>Car model <input name="car_model" placeholder="e.g. Tesla Model 3" required maxlength="60" /></label>
         <div class="units-field">
           <span>Distance units</span>
@@ -131,6 +133,15 @@
             <button type="submit">Save</button>
             <p id="status-msg" class="muted small-text" role="status"></p>
           </form>
+          <details class="danger-zone">
+            <summary>Delete my account</summary>
+            <form id="delete-form" class="form">
+              <p class="muted small-text">This permanently deletes your account, your charging history and everything you've posted. It can't be undone.</p>
+              <label>Your password <input name="password" type="password" autocomplete="current-password" required /></label>
+              <button type="submit" class="danger">Delete my account</button>
+              <p id="delete-error" class="error" role="alert"></p>
+            </form>
+          </details>
         </article>
 
         <!-- Broadcast + feed -->
@@ -159,6 +170,7 @@
           <button type="button" data-days="90">90 days</button>
         </div>
       </div>
+      <p class="muted small-text">Charts cover everyone. Driver names are only kept with sessions from the last 14 days.</p>
       <div id="usage-tiles" class="tiles"></div>
       <div class="grid usage-grid">
         <article class="card">

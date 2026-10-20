@@ -2,7 +2,7 @@
 
 A small web app for office EV drivers who share one charger.
 
-- **Accounts**: register and log in with email and password. Passwords are hashed with scrypt, and sessions use an HttpOnly cookie. Logins and sign-ups are rate-limited per IP (and logins per account).
+- **Accounts**: register and log in with email and password. Passwords are hashed with scrypt, and sessions use an HttpOnly cookie. Logins and sign-ups are rate-limited per IP (and logins per account). Set `ALLOWED_EMAIL_DOMAINS` and/or `SIGNUP_CODE` so only colleagues can sign up. Drivers can delete their account and all their data under **My car**.
 - **Driver dashboard**: every driver's charge %, estimated range, miles per day and days of range left. Drivers who will run out soonest are listed first.
 - **Driver profiles**: click any car photo or name (driver cards, queue, charger, feed) to open that driver's profile: a large car photo with credit, their battery and range, whether they are charging or queued right now, 30-day and all-time charging stats, recent sessions (with on-time or overstayed), and recent activity. Profiles have their own link (`#/driver/<id>`), and emails are never shown.
 - **My car**: update your charge level, daily mileage, full-charge range and car model.
@@ -14,7 +14,7 @@ A small web app for office EV drivers who share one charger.
   - The driver at the head of the queue gets an in-app alert, plus a browser notification if they enabled alerts.
   - The current driver is alerted when their promised finish time passes.
 - **Community feed**: a live feed of all activity, plus free-text broadcasts. It updates instantly over Server-Sent Events.
-- **Charger usage**: sessions, hours, average session length, how busy the charger is during office hours (Mon–Fri 8am–6pm), and the on-time finish rate. Also shows charts of hours per day and the busiest hours, and a per-driver breakdown with overstays.
+- **Charger usage**: sessions, hours, average session length, how busy the charger is during office hours (Mon–Fri 8am–6pm), and the on-time finish rate. Also shows charts of hours per day and the busiest hours, and a per-driver breakdown with overstays. Covers up to 90 days; sessions older than 14 days are sent without driver names, so the history can't be used to track when someone is in the office.
 
 ## Run locally
 
@@ -44,7 +44,7 @@ DATABASE_URL="postgresql://..." npm run seed:demo -- --remove
 
 1. **Database:** create a free project at https://neon.tech and copy its connection string (`postgresql://…?sslmode=require`).
 2. **App:** in https://dashboard.render.com, choose **New → Blueprint** and connect this GitHub repo. Render reads `render.yaml`.
-3. When asked for `DATABASE_URL`, paste the Neon connection string, then click **Apply**. Tables are created automatically on first start.
+3. When asked for `DATABASE_URL`, paste the Neon connection string. Also set `ALLOWED_EMAIL_DOMAINS` (e.g. `yourcompany.com`) and/or `SIGNUP_CODE`, otherwise anyone who finds the URL can sign up and see when colleagues charge. Then click **Apply**. Tables are created automatically on first start.
 4. Share the `https://<name>.onrender.com` URL with your colleagues.
 
 The free Render plan sleeps after about 15 minutes without traffic. The first visit afterwards takes roughly 30 seconds, and overdue reminders aren't sent while the app is asleep. Data lives in Neon, so nothing is lost.
@@ -58,6 +58,8 @@ The free Render plan sleeps after about 15 minutes without traffic. The first vi
 | `PGLITE_DIR` | `data/pglite` | Local embedded database folder, used when `DATABASE_URL` is unset |
 | `RESERVE_MINUTES` | `15` | How long the charger is held for the next driver in the queue |
 | `NODE_ENV` | — | Set to `production` to mark cookies `Secure` (requires HTTPS) |
+| `ALLOWED_EMAIL_DOMAINS` | — | Comma-separated email domains allowed to sign up, e.g. `acme.com,acme.co.uk`. Unset = any domain |
+| `SIGNUP_CODE` | — | Invite code required to sign up. Unset = no code |
 
 ## Structure
 
@@ -69,6 +71,6 @@ The free Render plan sleeps after about 15 minutes without traffic. The first vi
 
 ## API
 
-`POST /api/register`, `POST /api/login`, `POST /api/logout`, `GET /api/state`, `PUT /api/me`,
+`GET /api/signup-info`, `POST /api/register`, `POST /api/login`, `POST /api/logout`, `GET /api/state`, `PUT /api/me`, `DELETE /api/me`,
 `POST /api/charger/start|update|end`, `POST /api/queue/join|leave`, `POST /api/broadcast`,
 `GET /api/sessions?days=30`, `GET /api/stream` (SSE).

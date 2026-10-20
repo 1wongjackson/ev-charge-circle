@@ -10,6 +10,20 @@ const PORT = Number(process.env.PORT) || 3000;
 const RESERVE_MINUTES = Number(process.env.RESERVE_MINUTES) || 15;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const COOKIE_SECURE = process.env.NODE_ENV === 'production';
+// Who may sign up: work email domains (comma-separated) and/or a shared invite code.
+const ALLOWED_EMAIL_DOMAINS = (process.env.ALLOWED_EMAIL_DOMAINS || '')
+  .split(',')
+  .map((d) => d.trim().toLowerCase().replace(/^@/, ''))
+  .filter(Boolean);
+const SIGNUP_CODE = process.env.SIGNUP_CODE || '';
+// Charging history names drivers only this far back; older sessions are anonymous.
+const NAMED_HISTORY_DAYS = 14;
+// A charge counts as on time if it ended within this long of the promised end.
+const ON_TIME_GRACE_MS = 10 * 60_000;
+
+if (process.env.NODE_ENV === 'production' && !ALLOWED_EMAIL_DOMAINS.length && !SIGNUP_CODE) {
+  console.warn('Warning: anyone can sign up. Set ALLOWED_EMAIL_DOMAINS and/or SIGNUP_CODE to restrict it.');
+}
 
 const app = express();
 app.set('trust proxy', 1); // behind Render's proxy: real client IP for the login limiter
@@ -30,6 +44,7 @@ class HttpError extends Error {
 
 const nowIso = () => new Date().toISOString();
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
+const safeEqual = (a, b) => crypto.timingSafeEqual(Buffer.from(sha256(a)), Buffer.from(sha256(b)));
 
 function parseCookies(req) {
   const out = {};
@@ -277,6 +292,11 @@ async function chargerState() {
 
 app.get('/healthz', (req, res) => res.send('ok'));
 
+// What the sign-up form needs to ask for. The allowed domains aren't revealed.
+app.get('/api/signup-info', (req, res) => {
+  res.json({ invite_code: Boolean(SIGNUP_CODE), work_email: ALLOWED_EMAIL_DOMAINS.length > 0 });
+});
+
 app.post('/api/register', async (req, res) => {
   signupsByIp.check(req.ip);
   signupsTotal.check('all');
@@ -284,6 +304,12 @@ app.post('/api/register', async (req, res) => {
   const name = str(b.name, 'Name', 60);
   const email = str(b.email, 'Email', 120).toLowerCase();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new HttpError(400, 'Enter a valid email');
+  if (ALLOWED_EMAIL_DOMAINS.length && !ALLOWED_EMAIL_DOMAINS.includes(email.split('@')[1])) {
+    throw new HttpError(403, 'Sign up with your work email address');
+  }
+  if (SIGNUP_CODE && !safeEqual(String(b.invite_code || '').trim(), SIGNUP_CODE)) {
+    throw new HttpError(403, 'That invite code is not right. Ask a colleague for it.');
+  }
   const password = typeof b.password === 'string' ? b.password : '';
   if (password.length < 8) throw new HttpError(400, 'Password must be at least 8 characters');
   if (password.length > MAX_PASSWORD) throw new HttpError(400, `Password must be at most ${MAX_PASSWORD} characters`);
@@ -375,7 +401,8 @@ app.get('/api/users/:id/profile', auth, async (req, res) => {
   const monthAgo = now - 30 * 24 * 3600_000;
   const duration = (c) => (c.ended_at ? Date.parse(c.ended_at) : now) - Date.parse(c.started_at);
   const finished = sessions.filter((c) => c.ended_at);
-  const onTime = finished.filter((c) => Date.parse(c.ended_at) <= Date.parse(c.expected_end) + 10 * 60_000);
+  const isOnTime = (c) => Date.parse(c.ended_at) <= Date.parse(c.expected_end) + ON_TIME_GRACE_MS;
+  const onTime = finished.filter(isOnTime);
   const recent = sessions.filter((c) => Date.parse(c.started_at) >= monthAgo);
   const totalMs = sessions.reduce((sum, c) => sum + duration(c), 0);
   const stats = {
@@ -407,7 +434,12 @@ app.get('/api/users/:id/profile', auth, async (req, res) => {
     driver: { ...driver, member_since: user.created_at },
     status,
     stats,
-    sessions: sessions.slice(0, 10).map((c) => ({ ...c, on_time: c.ended_at ? Date.parse(c.ended_at) <= Date.parse(c.expected_end) + 10 * 60_000 : null })),
+    // Exact times only for recent sessions (all of them on your own profile).
+    sessions: sessions
+      .filter((c) => id === req.user.id || Date.parse(c.started_at) >= now - NAMED_HISTORY_DAYS * 24 * 3600_000)
+      .slice(0, 10)
+      .map((c) => ({ ...c, on_time: c.ended_at ? isOnTime(c) : null })),
+    named_history_days: NAMED_HISTORY_DAYS,
     events,
   });
 });
@@ -459,6 +491,21 @@ app.put('/api/me/preferences', auth, async (req, res) => {
   await all('UPDATE users SET units = $1 WHERE id = $2', [unitPref, req.user.id]);
   res.json({ ok: true, units: unitPref });
 });
+
+// Deletes the account and everything tied to it: charging history, queue spot,
+// sessions, and every feed event by or about this driver.
+app.delete('/api/me', auth, serialized(async (req, res) => {
+  const stored = await one('SELECT password_hash FROM users WHERE id = $1', [req.user.id]);
+  if (!(await verifyPassword(String(req.body?.password || ''), stored?.password_hash))) {
+    throw new HttpError(403, 'Wrong password');
+  }
+  await all('DELETE FROM events WHERE user_id = $1 OR target_user_id = $1', [req.user.id]);
+  await all('DELETE FROM users WHERE id = $1', [req.user.id]); // cascades sessions, charging history, queue
+  await refreshReservation();
+  broadcastRefresh();
+  setSessionCookie(res, '', 0);
+  res.json({ ok: true });
+}));
 
 app.post('/api/broadcast', auth, async (req, res) => {
   const message = str(req.body?.message, 'Message', 280);
@@ -533,18 +580,36 @@ app.post('/api/queue/leave', auth, serialized(async (req, res) => {
   res.json(await chargerState());
 }));
 
-// Charging history for the usage view; aggregation happens client-side so
-// days and hours are bucketed in the viewer's local time zone.
+// Charging history for the usage view. Charts are bucketed client-side so days
+// and hours land in the viewer's local time zone. Timestamps say when people
+// are in the office, so sessions older than NAMED_HISTORY_DAYS come without
+// names; per-driver numbers are totals only.
 app.get('/api/sessions', auth, async (req, res) => {
-  const days = num(req.query.days, 'Days', 1, 365, 30);
-  const since = new Date(Date.now() - days * 24 * 3600_000).toISOString();
+  const days = num(req.query.days, 'Days', 1, 90, 30);
+  const now = Date.now();
+  const since = new Date(now - days * 24 * 3600_000).toISOString();
+  const namedSince = new Date(now - NAMED_HISTORY_DAYS * 24 * 3600_000).toISOString();
   const rows = await all(
-    `SELECT c.id, c.user_id, u.name, c.started_at, c.expected_end, c.ended_at, c.start_level, c.end_level
+    `SELECT c.user_id, u.name, c.started_at, c.expected_end, c.ended_at
      FROM charge_sessions c JOIN users u ON u.id = c.user_id
      WHERE COALESCE(c.ended_at, '9999') >= $1 ORDER BY c.started_at`,
     [since]
   );
-  res.json({ since, sessions: rows });
+
+  const drivers = new Map();
+  for (const c of rows) {
+    const ms = (c.ended_at ? Date.parse(c.ended_at) : now) - Math.max(Date.parse(c.started_at), Date.parse(since));
+    const late = Boolean(c.ended_at) && Date.parse(c.ended_at) > Date.parse(c.expected_end) + ON_TIME_GRACE_MS;
+    const d = drivers.get(c.user_id) || { user_id: c.user_id, name: c.name, count: 0, ms: 0, late: 0, last: c.started_at };
+    d.count++;
+    d.ms += Math.max(0, ms);
+    if (late) d.late++;
+    if (c.started_at > d.last) d.last = c.started_at;
+    drivers.set(c.user_id, d);
+  }
+
+  const sessions = rows.map(({ user_id, name, ...c }) => (c.started_at >= namedSince ? { user_id, name, ...c } : c));
+  res.json({ since, named_since: namedSince, sessions, drivers: [...drivers.values()] });
 });
 
 app.get('/api/stream', auth, (req, res) => {

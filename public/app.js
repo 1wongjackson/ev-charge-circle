@@ -170,6 +170,15 @@ $$('[data-units]').forEach((btn) =>
   })
 );
 
+// Ask for an invite code / work email only when the server requires one.
+api('/api/signup-info')
+  .then((info) => {
+    $('#invite-field').hidden = !info.invite_code;
+    $('#invite-field input').required = info.invite_code;
+    $('#work-email-hint').hidden = !info.work_email;
+  })
+  .catch(() => {}); // the server will say what's missing on submit
+
 $('#login-form').addEventListener('submit', (e) => submitAuth(e, '/api/login'));
 $('#register-form').addEventListener('submit', (e) => submitAuth(e, '/api/register'));
 
@@ -579,6 +588,19 @@ $('#status-form').addEventListener('submit', async (e) => {
   }
 });
 
+$('#delete-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  $('#delete-error').textContent = '';
+  if (!confirm('Delete your account and all your data for good?')) return;
+  try {
+    await api('/api/me', { method: 'DELETE', body: { password: e.target.password.value } });
+    e.target.reset();
+    showAuth();
+  } catch (err) {
+    $('#delete-error').textContent = err.message;
+  }
+});
+
 $('#broadcast-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   try {
@@ -701,7 +723,7 @@ function sessionRow(s) {
     <td>${charge}</td><td>${done}</td></tr>`;
 }
 
-function renderProfile({ driver: d, status, stats, sessions, events }) {
+function renderProfile({ driver: d, status, stats, sessions, events, named_history_days }) {
   const isMe = d.id === state.me.id;
   const lvl = d.charge_level;
   const fill = lvl < 25 ? 'low' : lvl < 50 ? 'mid' : '';
@@ -752,7 +774,8 @@ function renderProfile({ driver: d, status, stats, sessions, events }) {
       ${tile('All-time sessions', stats.sessions)}
     </div>
     <div class="grid profile-grid">
-      <article class="card"><h3>Recent charging</h3>${history}</article>
+      <article class="card"><h3>Recent charging</h3>${history}
+        ${isMe ? '' : `<p class="muted small-text">Only sessions from the last ${named_history_days} days are listed.</p>`}</article>
       <article class="card"><h3>Recent activity</h3><ul class="feed">${activity}</ul></article>
     </div>`;
 }
@@ -779,7 +802,7 @@ function nextHour(t) {
 }
 
 async function loadUsage() {
-  const { sessions } = await api(`/api/sessions?days=${usageDays}`);
+  const { sessions, drivers } = await api(`/api/sessions?days=${usageDays}`);
   const now = Date.now();
   const rangeStart = new Date(now);
   rangeStart.setHours(0, 0, 0, 0);
@@ -792,7 +815,6 @@ async function loadUsage() {
   }
   const dayIdx = Object.fromEntries(days.map((d, i) => [d.key, i]));
   const hours = Array.from({ length: 24 }, (_, h) => ({ h, ms: 0 }));
-  const perDriver = new Map();
   let totalMs = 0;
   let officeBusyMs = 0;
   let overstays = 0;
@@ -814,14 +836,7 @@ async function loadUsage() {
     }
     const ms = end - start;
     totalMs += ms;
-    const late = s.ended_at && Date.parse(s.ended_at) > Date.parse(s.expected_end) + 10 * 60_000;
-    if (late) overstays++;
-    const p = perDriver.get(s.user_id) || { name: s.name, count: 0, ms: 0, late: 0, last: s.started_at };
-    p.count++;
-    p.ms += ms;
-    if (late) p.late++;
-    if (s.started_at > p.last) p.last = s.started_at;
-    perDriver.set(s.user_id, p);
+    if (s.ended_at && Date.parse(s.ended_at) > Date.parse(s.expected_end) + 10 * 60_000) overstays++;
   }
 
   let officeAvailMs = 0;
@@ -860,14 +875,15 @@ async function loadUsage() {
     })
   );
 
-  const rows = [...perDriver.values()].sort((a, b) => b.ms - a.ms);
+  // Per-driver totals come from the server, since older sessions arrive without names.
+  const rows = drivers.sort((a, b) => b.ms - a.ms);
   $('#driver-table').innerHTML = rows.length
     ? `<thead><tr><th>Driver</th><th class="num">Sessions</th><th class="num">Hours</th><th class="num">Avg session</th>
          <th>Share of use</th><th class="num">Overstays</th><th>Last charged</th></tr></thead>
        <tbody>${rows
          .map((r) => {
            const share = totalMs ? (r.ms / totalMs) * 100 : 0;
-           return `<tr><td>${esc(r.name)}</td><td class="num">${r.count}</td><td class="num">${hrs(r.ms).toFixed(1)}</td>
+           return `<tr><td>${nameLink(r.user_id, r.name)}</td><td class="num">${r.count}</td><td class="num">${hrs(r.ms).toFixed(1)}</td>
              <td class="num">${fmtDuration(r.ms / r.count / 60000)}</td>
              <td>${Math.round(share)}%<span class="share" style="width:${share * 0.8}px"></span></td>
              <td class="num">${r.late}</td><td>${fmtTime(r.last)}</td></tr>`;
