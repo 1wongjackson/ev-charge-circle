@@ -17,12 +17,12 @@ import { hashPassword } from '../passwords.js';
 const DEMO_EMAIL = '%@example.com';
 
 const DRIVERS = [
-  { name: 'Priya Shah', email: 'priya@example.com', car: 'Hyundai Ioniq 5', range: 266, charge: 18, daily: 42, units: 'imperial' },
-  { name: 'Marcus Lee', email: 'marcus@example.com', car: 'Tesla Model 3', range: 272, charge: 64, daily: 28, units: 'imperial' },
-  { name: 'Sofia Romero', email: 'sofia@example.com', car: 'Kia EV6', range: 310, charge: 35, daily: 34, units: 'metric' },
-  { name: 'Daniel Okafor', email: 'daniel@example.com', car: 'Nissan Leaf', range: 149, charge: 22, daily: 35, units: 'imperial' },
-  { name: 'Hannah Weber', email: 'hannah@example.com', car: 'VW ID.4', range: 275, charge: 81, daily: 20, units: 'metric' },
-  { name: 'Tom Nguyen', email: 'tom@example.com', car: 'Chevrolet Bolt EUV', range: 247, charge: 47, daily: 38, units: 'imperial' },
+  { name: 'Priya Shah', email: 'priya@example.com', color: '#2f5fb3', car: 'Hyundai Ioniq 5', range: 266, charge: 18, daily: 42, units: 'imperial' },
+  { name: 'Marcus Lee', email: 'marcus@example.com', color: '#f4f5f2', car: 'Tesla Model 3', range: 272, charge: 64, daily: 28, units: 'imperial' },
+  { name: 'Sofia Romero', email: 'sofia@example.com', color: '#c0392b', car: 'Kia EV6', range: 310, charge: 35, daily: 34, units: 'metric' },
+  { name: 'Daniel Okafor', email: 'daniel@example.com', color: '#c3c8cc', car: 'Nissan Leaf', range: 149, charge: 22, daily: 35, units: 'imperial' },
+  { name: 'Hannah Weber', email: 'hannah@example.com', color: '#1f2224', car: 'VW ID.4', range: 275, charge: 81, daily: 20, units: 'metric' },
+  { name: 'Tom Nguyen', email: 'tom@example.com', color: '#e07a2e', car: 'Chevrolet Bolt EUV', range: 247, charge: 47, daily: 38, units: 'imperial' },
 ];
 
 const args = process.argv.slice(2);
@@ -63,9 +63,9 @@ async function addDemo() {
   const id = {};
   for (const [i, d] of DRIVERS.entries()) {
     const row = await one(
-      `INSERT INTO users(name, email, password_hash, car_model, full_range_mi, charge_level, daily_miles, units, updated_at, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
-      [d.name, d.email, hash, d.car, d.range, d.charge, d.daily, d.units, iso(now - (15 + i * 40) * MIN), iso(joined + i * 90 * MIN)]
+      `INSERT INTO users(name, email, password_hash, car_model, full_range_mi, charge_level, daily_miles, units, car_color, updated_at, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
+      [d.name, d.email, hash, d.car, d.range, d.charge, d.daily, d.units, d.color, iso(now - (15 + i * 40) * MIN), iso(joined + i * 90 * MIN)]
     );
     id[d.name.split(' ')[0]] = row.id;
     await event('registered', row.id, { car_model: d.car }, joined + i * 90 * MIN);

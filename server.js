@@ -12,7 +12,10 @@ const COOKIE_SECURE = process.env.NODE_ENV === 'production';
 
 const app = express();
 app.set('trust proxy', 1); // behind Render's proxy: real client IP for the login limiter
-app.use(express.json({ limit: '20kb' }));
+const PHOTO_PATH = '/api/me/photo';
+const smallJson = express.json({ limit: '20kb' });
+// Car photo uploads get a bigger body limit than everything else.
+app.use((req, res, next) => (req.path === PHOTO_PATH ? next() : smallJson(req, res, next)));
 app.use(express.static(path.join(import.meta.dirname, 'public')));
 
 // ---------- helpers ----------
@@ -102,8 +105,22 @@ function publicUser(u) {
     daily_miles: u.daily_miles,
     est_range_mi: estRange,
     days_of_range: u.daily_miles > 0 ? Math.round((estRange / u.daily_miles) * 10) / 10 : null,
+    car_color: u.car_color,
+    photo_version: u.car_photo_at, // null = no photo; changes bust the browser cache
     updated_at: u.updated_at,
   };
+}
+
+// Every users column except the photo itself, which is only read by the photo route.
+const userCols = (p = '') =>
+  ['id', 'name', 'email', 'password_hash', 'car_model', 'full_range_mi', 'charge_level', 'daily_miles',
+   'units', 'car_color', 'car_photo_at', 'updated_at', 'created_at'].map((c) => p + c).join(', ');
+
+const CAR_COLORS = ['#f4f5f2', '#1f2224', '#c3c8cc', '#6c757b', '#2f5fb3', '#c0392b', '#2e7d5b', '#e3b23c', '#e07a2e'];
+function carColor(value, fallback) {
+  if (value === undefined || value === '') return fallback;
+  if (!CAR_COLORS.includes(value)) throw new HttpError(400, 'Pick one of the listed car colours');
+  return value;
 }
 
 // Charger/queue changes read-then-write shared state, so run them one at a time.
@@ -123,7 +140,7 @@ async function auth(req, res, next) {
   const user =
     token &&
     (await one(
-      `SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+      `SELECT ${userCols('u.')} FROM sessions s JOIN users u ON u.id = s.user_id
        WHERE s.token_hash = $1 AND s.expires_at > $2`,
       [sha256(token), nowIso()]
     ));
@@ -263,7 +280,7 @@ app.post('/api/login', async (req, res) => {
   checkLoginRate(req.ip);
   const email = String(req.body?.email || '').trim().toLowerCase();
   const password = String(req.body?.password || '');
-  const user = await one('SELECT * FROM users WHERE email = $1', [email]);
+  const user = await one(`SELECT ${userCols()} FROM users WHERE email = $1`, [email]);
   if (!user || !verifyPassword(password, user.password_hash)) {
     recordLoginFailure(req.ip);
     throw new HttpError(401, 'Wrong email or password');
@@ -283,7 +300,7 @@ app.post('/api/logout', async (req, res) => {
 // ---------- routes: community ----------
 
 app.get('/api/state', auth, async (req, res) => {
-  const drivers = (await all('SELECT * FROM users ORDER BY name')).map(publicUser);
+  const drivers = (await all(`SELECT ${userCols()} FROM users ORDER BY name`)).map(publicUser);
   const events = (await all(`${eventSelect} ORDER BY e.id DESC LIMIT 60`)).map(formatEvent);
   res.json({
     me: { ...publicUser(req.user), units: req.user.units },
@@ -301,12 +318,38 @@ app.put('/api/me', auth, async (req, res) => {
   const daily = num(b.daily_miles, 'Daily mileage', 0, 1000, u.daily_miles);
   const fullRange = num(b.full_range_mi, 'Full-charge range', 10, 1000, u.full_range_mi);
   const carModel = b.car_model === undefined ? u.car_model : str(b.car_model, 'Car model', 60);
+  const color = carColor(b.car_color, u.car_color);
   await all(
-    'UPDATE users SET charge_level = $1, daily_miles = $2, full_range_mi = $3, car_model = $4, updated_at = $5 WHERE id = $6',
-    [charge, daily, fullRange, carModel, nowIso(), u.id]
+    'UPDATE users SET charge_level = $1, daily_miles = $2, full_range_mi = $3, car_model = $4, car_color = $5, updated_at = $6 WHERE id = $7',
+    [charge, daily, fullRange, carModel, color, nowIso(), u.id]
   );
   await logEvent('status', u.id, { charge_level: charge, daily_miles: daily });
   res.json({ ok: true });
+});
+
+// Photos are resized in the browser to a small JPEG before upload.
+const MAX_PHOTO_BYTES = 60 * 1024;
+app.put(PHOTO_PATH, express.json({ limit: '120kb' }), auth, async (req, res) => {
+  const match = /^data:image\/jpeg;base64,([A-Za-z0-9+/=]+)$/.exec(req.body?.photo || '');
+  const bytes = match && Buffer.from(match[1], 'base64');
+  if (!bytes || bytes[0] !== 0xff || bytes[1] !== 0xd8) throw new HttpError(400, 'Upload a JPEG image');
+  if (bytes.length > MAX_PHOTO_BYTES) throw new HttpError(413, 'That photo is too large');
+  await all('UPDATE users SET car_photo = $1, car_photo_at = $2 WHERE id = $3', [match[1], nowIso(), req.user.id]);
+  await logEvent('photo', req.user.id, { car_model: req.user.car_model });
+  res.json({ ok: true });
+});
+
+app.delete(PHOTO_PATH, auth, async (req, res) => {
+  await all('UPDATE users SET car_photo = NULL, car_photo_at = NULL WHERE id = $1', [req.user.id]);
+  res.json({ ok: true });
+});
+
+app.get('/api/users/:id/photo', auth, async (req, res) => {
+  const row = await one('SELECT car_photo FROM users WHERE id = $1', [Number(req.params.id) || 0]);
+  if (!row?.car_photo) throw new HttpError(404, 'No photo');
+  // URLs carry ?v=<upload time>, so a new upload gets a new URL.
+  res.set({ 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, max-age=31536000, immutable' });
+  res.send(Buffer.from(row.car_photo, 'base64'));
 });
 
 app.put('/api/me/preferences', auth, async (req, res) => {

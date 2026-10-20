@@ -175,6 +175,34 @@ label { display: grid; gap: 4px; font-size: 0.88rem; color: var(--ink-2); }
 .driver-stats strong { display: block; color: var(--ink); font-size: 0.95rem; font-variant-numeric: tabular-nums; }
 .driver-foot { margin-top: 10px; display: flex; justify-content: space-between; align-items: center; gap: 6px; font-size: 0.78rem; color: var(--muted); }
 
+/* ---- car thumbnails ---- */
+.car-thumb {
+  flex: none; width: 72px; height: 48px; border-radius: 8px; overflow: hidden;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--surface-2); object-fit: cover;
+}
+.car-thumb svg { width: 90%; height: auto; display: block; }
+@media (prefers-color-scheme: dark) {
+  .car-thumb .car-body { stroke: #fff; stroke-opacity: 0.35; } /* keeps dark paint visible */
+}
+.car-thumb.sm { width: 48px; height: 32px; border-radius: 6px; }
+.car-thumb.lg { width: 120px; height: 80px; border-radius: 10px; }
+.driver-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; min-width: 0; }
+.driver-id { min-width: 0; }
+.driver-head .driver-car { margin-bottom: 0; }
+.charger-main { display: flex; align-items: center; gap: 14px; }
+.charger-main > div { min-width: 0; }
+.car-edit { display: flex; gap: 12px; align-items: center; }
+.car-edit-controls { display: grid; gap: 8px; min-width: 0; }
+.swatches { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.swatch {
+  width: 22px; height: 22px; padding: 0; border-radius: 50%;
+  border: 1px solid rgb(0 0 0 / 0.25); box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.25);
+}
+.swatch.active { outline: 2px solid var(--accent); outline-offset: 2px; }
+.photo-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+@media (max-width: 520px) { .charger-main .car-thumb.lg { width: 84px; height: 56px; } }
+
 /* ---- feed ---- */
 .broadcast { display: flex; gap: 8px; margin-bottom: 12px; }
 .feed { list-style: none; margin: 0; padding: 0; max-height: 520px; overflow: auto; }

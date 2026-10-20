@@ -78,6 +78,12 @@ await rawExec(`
   -- Display preference only; distances are always stored in miles.
   ALTER TABLE users ADD COLUMN IF NOT EXISTS units TEXT NOT NULL DEFAULT 'imperial';
 
+  -- Car thumbnail: a paint colour for the illustration, or an uploaded photo
+  -- (small JPEG, base64) that replaces it.
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS car_color TEXT;
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS car_photo TEXT;
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS car_photo_at TEXT;
+
   CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT

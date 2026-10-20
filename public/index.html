@@ -52,10 +52,10 @@
           </div>
         </div>
         <div class="row">
-          <label>Full-charge range (<span class="u-dist">mi</span>) <input name="full_range_mi" type="number" min="10" max="1600" value="250" required /></label>
+          <label><span>Full-charge range (<span class="u-dist">mi</span>)</span> <input name="full_range_mi" type="number" min="10" max="1600" value="250" required /></label>
           <label>Current charge (%) <input name="charge_level" type="number" min="0" max="100" value="50" required /></label>
         </div>
-        <label>Daily driving (<span class="u-dist">mi</span>) <input name="daily_miles" type="number" min="0" max="1600" value="30" required /></label>
+        <label><span>Daily driving (<span class="u-dist">mi</span>)</span> <input name="daily_miles" type="number" min="0" max="1600" value="30" required /></label>
         <button type="submit">Create account</button>
       </form>
       <p id="auth-error" class="error" role="alert"></p>
@@ -107,11 +107,26 @@
               <input name="charge_level" id="charge-range" type="range" min="0" max="100" step="1" />
             </label>
             <div class="row">
-              <label>Daily driving (<span class="u-dist">mi</span>) <input name="daily_miles" type="number" min="0" max="1600" step="1" required /></label>
-              <label>Full range (<span class="u-dist">mi</span>) <input name="full_range_mi" type="number" min="10" max="1600" step="1" required /></label>
+              <label><span>Daily driving (<span class="u-dist">mi</span>)</span> <input name="daily_miles" type="number" min="0" max="1600" step="1" required /></label>
+              <label><span>Full range (<span class="u-dist">mi</span>)</span> <input name="full_range_mi" type="number" min="10" max="1600" step="1" required /></label>
             </div>
             <label>Car model <input name="car_model" maxlength="60" required /></label>
-            <button type="submit">Update my status</button>
+            <div class="car-edit">
+              <div id="my-car-thumb"></div>
+              <div class="car-edit-controls">
+                <div id="color-picker">
+                  <span class="muted small-text">Colour</span>
+                  <div id="color-swatches" class="swatches" role="radiogroup" aria-label="Car colour"></div>
+                </div>
+                <div class="photo-actions">
+                  <button type="button" class="ghost small" id="photo-upload">Upload a photo</button>
+                  <button type="button" class="ghost small" id="photo-remove">Remove photo</button>
+                  <input id="photo-input" type="file" accept="image/*" hidden />
+                </div>
+              </div>
+            </div>
+            <input type="hidden" name="car_color" />
+            <button type="submit">Save</button>
             <p id="status-msg" class="muted small-text" role="status"></p>
           </form>
         </article>
@@ -157,6 +172,7 @@
 
   <div id="tooltip" class="tooltip" hidden></div>
   <div id="toast" class="toast" hidden></div>
+  <script src="cars.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

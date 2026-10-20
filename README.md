@@ -5,6 +5,7 @@ A small web app for office EV drivers who share one charger.
 - **Accounts**: register and log in with email and password. Passwords are hashed with scrypt, and sessions use an HttpOnly cookie.
 - **Driver dashboard**: every driver's charge %, estimated range, miles per day and days of range left. Drivers who will run out soonest are listed first.
 - **My car**: update your charge level, daily mileage, full-charge range and car model.
+- **Car thumbnails**: each driver gets a side-view illustration of their car. The body style (sedan, SUV, hatchback or pickup) is guessed from the model name, and the driver picks the paint colour. They can also upload a photo of their own car, which the browser shrinks to a small JPEG before uploading.
 - **Miles or kilometres**: each driver picks their units (mi/km switch in the header, or at sign-up). The choice is saved to their account. Distances are stored in miles and converted for display.
 - **Shared charger**:
   - Plug in and broadcast when you expect to finish (30m–4h, or "done by" a time).

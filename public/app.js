@@ -275,6 +275,12 @@ function durationPicker(action, label) {
     </div>`;
 }
 
+/** Car thumbnail for a driver id from the current drivers list. */
+function thumbFor(userId, size) {
+  const d = state.drivers.find((x) => x.id === userId);
+  return d ? carThumb(d, size) : '';
+}
+
 function renderCharger() {
   const { active, reservation, queue } = state.charger;
   const me = state.me;
@@ -299,9 +305,14 @@ function renderCharger() {
     const remaining = (end - Date.now()) / 60000;
     const mine = active.user_id === me.id;
     body = `
-      <p class="charger-big">${mine ? "You're charging" : `${esc(active.name)} is charging`}</p>
-      <p class="charger-sub">${esc(active.car_model)} · plugged in at ${fmtTime(active.started_at)}
-        ${active.start_level != null ? ` at ${active.start_level}%` : ''}</p>
+      <div class="charger-main">
+        ${thumbFor(active.user_id, 'lg')}
+        <div>
+          <p class="charger-big">${mine ? "You're charging" : `${esc(active.name)} is charging`}</p>
+          <p class="charger-sub">${esc(active.car_model)} · plugged in at ${fmtTime(active.started_at)}
+            ${active.start_level != null ? ` at ${active.start_level}%` : ''}</p>
+        </div>
+      </div>
       <div class="progress ${mode === 'late' ? 'late' : ''}"><span style="width:${pct}%"></span></div>
       <p class="charger-sub"><strong>Expected done ${fmtTime(active.expected_end)}</strong>
         · ${remaining >= 0 ? `${fmtDuration(remaining)} left` : `${fmtDuration(-remaining)} over`}
@@ -321,11 +332,12 @@ function renderCharger() {
     }
   } else if (reservation) {
     const mine = reservation.user_id === me.id;
-    body = mine
+    const text = mine
       ? `<p class="charger-big">⚡ It's your turn!</p>
          <p class="charger-sub">The charger is held for you until <strong>${fmtTime(reservation.until)}</strong>. Plug in and let everyone know how long you'll be.</p>`
       : `<p class="charger-big">Held for ${esc(reservation.name)}</p>
          <p class="charger-sub">They're next in the queue and have until ${fmtTime(reservation.until)} to plug in. After that, anyone can use it.</p>`;
+    body = `<div class="charger-main">${thumbFor(reservation.user_id, 'lg')}<div>${text}</div></div>`;
     actions = mine
       ? `${durationPicker('start', 'Charging for:')}<button class="ghost small" data-act="leave" type="button">Skip my turn</button>`
       : queueActions(inQueue);
@@ -397,6 +409,7 @@ function renderQueue() {
           (q, i) => `
       <li>
         <span class="pos">${i + 1}</span>
+        ${thumbFor(q.user_id, 'sm')}
         <div class="who">
           <strong>${esc(q.name)}</strong>${q.user_id === state.me.id ? ' (you)' : ''}
           <span class="muted small-text"> · ${q.charge_level}% · joined ${fmtTime(q.joined_at)}</span>
@@ -425,10 +438,13 @@ function renderDrivers() {
             : '';
       return `
       <div class="driver ${d.id === state.me.id ? 'me' : ''}">
-        <div class="driver-top">
-          <span class="driver-name">${esc(d.name)}${d.id === state.me.id ? ' (you)' : ''}</span>
+        <div class="driver-head">
+          ${carThumb(d)}
+          <div class="driver-id">
+            <div class="driver-name">${esc(d.name)}${d.id === state.me.id ? ' (you)' : ''}</div>
+            <div class="driver-car">${esc(d.car_model)}</div>
+          </div>
         </div>
-        <div class="driver-car">${esc(d.car_model)}</div>
         <div class="battery" role="img" aria-label="Battery ${lvl} percent">
           <div class="battery-shell"><div class="battery-fill ${cls}" style="width:${lvl}%"></div></div>
           <div class="battery-cap"></div>
@@ -453,11 +469,71 @@ function renderStatusForm() {
   f.daily_miles.value = showDist(state.me.daily_miles);
   f.full_range_mi.value = showDist(state.me.full_range_mi);
   f.car_model.value = state.me.car_model;
+  f.car_color.value = state.me.car_color || '';
+  renderMyCar();
 }
+
+// Live preview of the "My car" thumbnail from the form's current values.
+function renderMyCar() {
+  const f = $('#status-form');
+  const me = state.me;
+  const color = f.car_color.value || me.car_color || defaultCarColor(me.name);
+  $('#my-car-thumb').innerHTML = carThumb({ ...me, car_model: f.car_model.value || me.car_model, car_color: color }, 'lg');
+  $$('#color-swatches .swatch').forEach((s) => {
+    s.classList.toggle('active', s.dataset.color === color);
+    s.setAttribute('aria-checked', s.dataset.color === color);
+  });
+  // A photo replaces the illustration, so the colour only matters without one.
+  $('#color-picker').hidden = Boolean(me.photo_version);
+  $('#photo-remove').hidden = !me.photo_version;
+  $('#photo-upload').textContent = me.photo_version ? 'Change photo' : 'Upload a photo';
+}
+
+$('#color-swatches').innerHTML = CAR_COLORS.map(
+  (c) => `<button type="button" class="swatch" role="radio" data-color="${c.hex}" style="background:${c.hex}" title="${c.name}" aria-label="${c.name}"></button>`
+).join('');
+
+$('#color-swatches').addEventListener('click', (e) => {
+  const swatch = e.target.closest('.swatch');
+  if (!swatch) return;
+  $('#status-form').car_color.value = swatch.dataset.color;
+  statusDirty = true;
+  renderMyCar();
+});
+
+$('#photo-upload').addEventListener('click', () => $('#photo-input').click());
+
+$('#photo-input').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  const msg = $('#status-msg');
+  try {
+    msg.textContent = 'Uploading photo…';
+    const photo = await resizeCarPhoto(file);
+    await api('/api/me/photo', { method: 'PUT', body: { photo } });
+    msg.textContent = 'Photo saved.';
+    await reload();
+    renderMyCar();
+  } catch (err) {
+    msg.textContent = err.message;
+  }
+});
+
+$('#photo-remove').addEventListener('click', async () => {
+  try {
+    await api('/api/me/photo', { method: 'DELETE' });
+    await reload();
+    renderMyCar();
+  } catch (err) {
+    $('#status-msg').textContent = err.message;
+  }
+});
 
 $('#status-form').addEventListener('input', (e) => {
   statusDirty = true;
   if (e.target.name === 'charge_level') $('#charge-out').textContent = e.target.value;
+  if (e.target.name === 'car_model') renderMyCar();
 });
 
 $('#status-form').addEventListener('submit', async (e) => {
@@ -501,6 +577,7 @@ function eventText(ev) {
     case 'queue_leave': return `${a} left the queue`;
     case 'your_turn': return `➡️ Charger passed to ${t} — held until ${fmtTime(d.until)}`;
     case 'overdue': return `<span class="alert">⏰ ${t}'s charge was due at ${fmtTime(d.expected_end)}</span>`;
+    case 'photo': return `📷 ${a} added a photo of their ${esc(d.car_model)}`;
     case 'message': return `💬 ${a}<br><span class="msg">${esc(d.message)}</span>`;
     default: return esc(ev.type);
   }
