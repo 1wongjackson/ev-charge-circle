@@ -33,9 +33,7 @@ const inputToMiles = (v) => (v === '' || v == null ? v : units === 'metric' ? Nu
 function applyUnits() {
   try { localStorage.setItem('units', units); } catch {}
   $$('.u-dist').forEach((el) => (el.textContent = distUnit()));
-  $$('[data-units], [data-reg-units]').forEach((b) =>
-    b.classList.toggle('active', (b.dataset.units || b.dataset.regUnits) === units)
-  );
+  $$('[data-units], [data-reg-units]').forEach((b) => setPressed(b, (b.dataset.units || b.dataset.regUnits) === units));
   // Server limits are 1000 mi; keep the input limits equivalent.
   const max = units === 'metric' ? 1600 : 1000;
   $$('input[name="full_range_mi"], input[name="daily_miles"]').forEach((i) => (i.max = max));
@@ -92,16 +90,57 @@ function ago(iso) {
   return `${Math.round(min / 1440)}d ago`;
 }
 
-function toast(text) {
-  const el = $('#toast');
-  el.textContent = text;
-  el.hidden = false;
-  clearTimeout(toast.t);
-  toast.t = setTimeout(() => (el.hidden = true), 5000);
+/** Mark a toggle button as on/off, for both the styling and screen readers. */
+function setPressed(btn, on) {
+  btn.classList.toggle('active', on);
+  btn.setAttribute('aria-pressed', on);
 }
 
+/** Mark a tab as the selected one in its tablist. */
+function selectTab(tab, on) {
+  tab.classList.toggle('active', on);
+  tab.setAttribute('aria-selected', on);
+  tab.tabIndex = on ? 0 : -1;
+}
+
+// Arrow keys move between tabs, as in any tablist.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  const tab = e.target.closest?.('[role="tab"]');
+  if (!tab) return;
+  const tabs = [...tab.parentElement.querySelectorAll('[role="tab"]')];
+  const next = tabs[(tabs.indexOf(tab) + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length];
+  next.focus();
+  next.click();
+});
+
+/**
+ * Show a message at the bottom of the screen. The region is aria-live, so
+ * screen readers announce it. Sticky messages stay until dismissed.
+ */
+function toast(text, { sticky = false } = {}) {
+  const el = $('#toast');
+  el.innerHTML = `<div class="toast"><span>${esc(text)}</span><button type="button" class="toast-close" aria-label="Dismiss">✕</button></div>`;
+  clearTimeout(toast.t);
+  if (!sticky) toast.t = setTimeout(() => (el.innerHTML = ''), 6000);
+}
+$('#toast').addEventListener('click', (e) => {
+  if (e.target.closest('.toast-close')) $('#toast').innerHTML = '';
+});
+
+/** Disable a set of buttons while fn runs, so a double-click can't send it twice. */
+async function whileBusy(buttons, fn) {
+  buttons.forEach((b) => (b.disabled = true));
+  try {
+    return await fn();
+  } finally {
+    buttons.forEach((b) => (b.disabled = false));
+  }
+}
+
+// Alerts about your turn at the charger: they matter, so they stay until dismissed.
 function notify(text) {
-  toast(text);
+  toast(text, { sticky: true });
   if ('Notification' in window && Notification.permission === 'granted') {
     new Notification('EV Charge Circle', { body: text });
   }
@@ -113,6 +152,8 @@ function showAuth() {
   state = null;
   stream?.close();
   stream = null;
+  clearTimeout(retryTimer);
+  setOffline(false);
   $('#auth-view').hidden = false;
   $('#app-view').hidden = true;
   $('#userbar').hidden = true;
@@ -126,7 +167,7 @@ function showApp() {
 
 $$('[data-auth]').forEach((btn) =>
   btn.addEventListener('click', () => {
-    $$('[data-auth]').forEach((b) => b.classList.toggle('active', b === btn));
+    $$('[data-auth]').forEach((b) => selectTab(b, b === btn));
     $('#login-form').hidden = btn.dataset.auth !== 'login';
     $('#register-form').hidden = btn.dataset.auth !== 'register';
     $('#auth-error').textContent = '';
@@ -143,7 +184,7 @@ async function submitAuth(e, url) {
     body.units = units;
   }
   try {
-    await api(url, { method: 'POST', body });
+    await whileBusy([e.submitter || e.target.querySelector('[type="submit"]')], () => api(url, { method: 'POST', body }));
     e.target.reset();
     await boot();
   } catch (err) {
@@ -216,13 +257,21 @@ async function boot() {
   connectStream();
 }
 
+// Shown whenever the live feed or a refresh fails, so nobody acts on stale data.
+const setOffline = (offline) => ($('#conn-banner').hidden = !offline);
+
 async function reload() {
   try {
     state = await api('/api/state');
-    render();
-    if (!$('#view-usage').hidden) loadUsage();
-    if (!$('#view-profile').hidden && profileId) loadProfile(profileId);
-  } catch {}
+  } catch {
+    // A 401 already sent us back to the login screen; anything else means we're out of date.
+    if (state) setOffline(true);
+    return;
+  }
+  if (stream?.readyState === EventSource.OPEN) setOffline(false);
+  render();
+  if (!$('#view-usage').hidden) loadUsage();
+  if (!$('#view-profile').hidden && profileId) loadProfile(profileId);
 }
 
 let reloadTimer;
@@ -231,9 +280,31 @@ const scheduleReload = () => {
   reloadTimer = setTimeout(reload, 150);
 };
 
+// EventSource retries on its own after a dropped connection, but gives up for
+// good on an error response (e.g. a 502 while the server restarts). Then we
+// retry ourselves, backing off, via /api/state, which also catches a 401.
+let retryTimer;
+let retryDelay = 2000;
+
+function retryStream() {
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(async () => {
+    await reload();
+    if (state) connectStream();
+  }, retryDelay);
+  retryDelay = Math.min(retryDelay * 2, 60_000);
+}
+
 function connectStream() {
   if (stream) return;
   stream = new EventSource('/api/stream');
+  stream.onerror = () => {
+    setOffline(true);
+    if (stream?.readyState === EventSource.CLOSED) {
+      stream = null;
+      retryStream();
+    }
+  };
   stream.onmessage = (msg) => {
     const ev = JSON.parse(msg.data);
     const me = state?.me;
@@ -250,8 +321,12 @@ function connectStream() {
     }
     scheduleReload();
   };
-  // EventSource reconnects on its own; resync whenever it does.
-  stream.onopen = scheduleReload;
+  // Resync whenever the stream (re)connects, since events may have been missed.
+  stream.onopen = () => {
+    retryDelay = 2000;
+    setOffline(false);
+    scheduleReload();
+  };
 }
 
 // ---------- rendering ----------
@@ -362,7 +437,7 @@ function renderCharger() {
          <p class="charger-sub">They're next in the queue and have until ${fmtTime(reservation.until)} to plug in. After that, anyone can use it.</p>`;
     body = `<div class="charger-main">${thumbFor(reservation.user_id, 'lg')}<div>${text}</div></div>`;
     actions = mine
-      ? `${durationPicker('start', 'Charging for:')}<button class="ghost small" data-act="leave" type="button">Skip my turn</button>`
+      ? `${durationPicker('start', 'Charging for:')}<button class="ghost small" data-act="leave" data-confirm="Give up your turn? The charger will pass to the next driver and you'll leave the queue." type="button">Skip my turn</button>`
       : queueActions(inQueue);
   } else {
     body = `<p class="charger-big">The charger is free</p>
@@ -383,7 +458,7 @@ function queueActions(inQueue) {
   return inQueue
     ? `<button class="ghost" data-act="leave" type="button">Leave the queue</button>`
     : `<div class="inline-field">
-         <input id="queue-note" maxlength="140" placeholder="Optional note, e.g. 'at 15%, need ~2h'" />
+         <input id="queue-note" maxlength="140" placeholder="Optional note, e.g. 'at 15%, need ~2h'" aria-label="Note for the queue (optional)" />
          <button data-act="join" type="button">Join the queue</button>
        </div>`;
 }
@@ -403,6 +478,9 @@ $('#charger-actions').addEventListener('click', async (e) => {
   if (!btn) return;
   const act = btn.dataset.act;
   $('#charger-error').textContent = '';
+  if (btn.dataset.confirm && !confirm(btn.dataset.confirm)) return;
+  const buttons = $$('#charger-actions button');
+  buttons.forEach((b) => (b.disabled = true));
   try {
     let expected_end;
     if (btn.dataset.hours) expected_end = new Date(Date.now() + Number(btn.dataset.hours) * 3600_000).toISOString();
@@ -420,6 +498,8 @@ $('#charger-actions').addEventListener('click', async (e) => {
     await reload();
   } catch (err) {
     $('#charger-error').textContent = err.message;
+  } finally {
+    buttons.forEach((b) => (b.disabled = false)); // no-op if a re-render replaced them
   }
 });
 
@@ -578,7 +658,7 @@ $('#status-form').addEventListener('submit', async (e) => {
     const body = Object.fromEntries(new FormData(e.target));
     body.daily_miles = inputToMiles(body.daily_miles);
     body.full_range_mi = inputToMiles(body.full_range_mi);
-    await api('/api/me', { method: 'PUT', body });
+    await whileBusy([e.target.querySelector('[type="submit"]')], () => api('/api/me', { method: 'PUT', body }));
     statusDirty = false;
     msg.textContent = 'Saved.';
     setTimeout(() => (msg.textContent = ''), 2500);
@@ -604,7 +684,9 @@ $('#delete-form').addEventListener('submit', async (e) => {
 $('#broadcast-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   try {
-    await api('/api/broadcast', { method: 'POST', body: { message: e.target.message.value } });
+    await whileBusy([e.target.querySelector('button')], () =>
+      api('/api/broadcast', { method: 'POST', body: { message: e.target.message.value } })
+    );
     e.target.reset();
   } catch (err) {
     toast(err.message);
@@ -647,7 +729,7 @@ function showView(name) {
   $('#view-community').hidden = name !== 'community';
   $('#view-usage').hidden = name !== 'usage';
   $('#view-profile').hidden = name !== 'profile';
-  $$('[data-view]').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
+  $$('[data-view]').forEach((b) => selectTab(b, b.dataset.view === name));
   if (name === 'usage') loadUsage();
 }
 
@@ -780,13 +862,7 @@ function renderProfile({ driver: d, status, stats, sessions, events, named_histo
     </div>`;
 }
 
-$$('[data-days]').forEach((btn) =>
-  btn.addEventListener('click', () => {
-    $$('[data-days]').forEach((b) => b.classList.toggle('active', b === btn));
-    usageDays = Number(btn.dataset.days);
-    loadUsage();
-  })
-);
+$$('[data-days]').forEach((btn) => btn.addEventListener('click', () => loadUsage(Number(btn.dataset.days))));
 
 // ---------- usage analytics ----------
 
@@ -801,8 +877,28 @@ function nextHour(t) {
   return d.getTime();
 }
 
-async function loadUsage() {
-  const { sessions, drivers } = await api(`/api/sessions?days=${usageDays}`);
+/** Fetch and show usage for a range. The range buttons only switch once it has loaded. */
+async function loadUsage(days = usageDays) {
+  const view = $('#view-usage');
+  const request = (loadUsage.last = {});
+  view.setAttribute('aria-busy', 'true');
+  $('#usage-error').textContent = '';
+  let data;
+  try {
+    data = await api(`/api/sessions?days=${days}`);
+  } catch (err) {
+    if (loadUsage.last === request) $('#usage-error').textContent = `Couldn't load usage: ${err.message}`;
+    return;
+  } finally {
+    if (loadUsage.last === request) view.removeAttribute('aria-busy');
+  }
+  if (loadUsage.last !== request) return; // a newer request superseded this one
+  usageDays = days;
+  $$('[data-days]').forEach((b) => setPressed(b, Number(b.dataset.days) === days));
+  renderUsage(data);
+}
+
+function renderUsage({ sessions, drivers }) {
   const now = Date.now();
   const rangeStart = new Date(now);
   rangeStart.setHours(0, 0, 0, 0);
@@ -897,25 +993,56 @@ function barChart(el, data) {
   el.innerHTML = `
     <div class="bars-max">max ${max < 0.01 ? 0 : max.toFixed(1)} h</div>
     <div class="bars-plot">${data
-      .map((d) => `<div class="bar-slot" data-tip="${esc(d.tip)}"><div class="bar" style="height:${(d.value / max) * 100}%"></div></div>`)
+      .map(
+        (d, i) => `<div class="bar-slot" data-tip="${esc(d.tip)}" role="img" aria-label="${esc(d.tip)}" tabindex="${i === 0 ? 0 : -1}">
+          <div class="bar" style="height:${(d.value / max) * 100}%"></div></div>`
+      )
       .join('')}</div>
     <div class="bars-axis">${data.map((d) => `<span>${esc(d.label)}</span>`).join('')}</div>`;
 }
 
-// Shared hover tooltip for chart bars.
-document.addEventListener('mousemove', (e) => {
+// Shared tooltip for chart bars: follows the mouse, or sits above a bar that
+// was tapped or reached with the keyboard.
+function showTip(slot, x, y) {
   const tip = $('#tooltip');
-  const slot = e.target.closest?.('[data-tip]');
   if (!slot) return (tip.hidden = true);
   tip.textContent = slot.dataset.tip;
   tip.hidden = false;
-  const x = Math.min(e.clientX + 12, window.innerWidth - tip.offsetWidth - 8);
-  tip.style.left = `${x}px`;
-  tip.style.top = `${e.clientY - 34}px`;
+  tip.style.left = `${Math.max(8, Math.min(x + 12, window.innerWidth - tip.offsetWidth - 8))}px`;
+  tip.style.top = `${y - 34}px`;
+}
+const showTipAbove = (slot) => {
+  const r = slot.getBoundingClientRect();
+  showTip(slot, r.left + r.width / 2 - 12, r.top);
+};
+document.addEventListener('mousemove', (e) => {
+  const slot = e.target.closest?.('[data-tip]');
+  const keyboardTip = document.activeElement?.dataset?.tip !== undefined;
+  if (slot || !keyboardTip) showTip(slot, e.clientX, e.clientY); // don't hide a focused bar's tip
+});
+document.addEventListener('click', (e) => {
+  const slot = e.target.closest?.('[data-tip]');
+  if (slot) showTipAbove(slot);
+});
+document.addEventListener('focusin', (e) => (e.target.dataset?.tip ? showTipAbove(e.target) : showTip(null)));
+document.addEventListener('focusout', () => showTip(null));
+// Arrow keys step through a chart's bars; only one bar is a tab stop.
+document.addEventListener('keydown', (e) => {
+  const slot = e.target.closest?.('.bar-slot');
+  if (!slot) return;
+  const slots = [...slot.parentElement.children];
+  const i = slots.indexOf(slot);
+  const next = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: slots.length - 1 }[e.key];
+  if (next === undefined || !slots[next]) return;
+  e.preventDefault();
+  slot.tabIndex = -1;
+  slots[next].tabIndex = 0;
+  slots[next].focus();
 });
 
-// Keep countdowns and "x minutes ago" fresh.
-setInterval(() => state && render(), 30_000);
+// Re-fetch now and then too, in case an update was missed; this also keeps
+// countdowns and "x minutes ago" fresh.
+setInterval(() => state && reload(), 30_000);
 
 convertDistInputs($('#register-form'), 'imperial', units); // defaults in the HTML are miles
 applyUnits();
