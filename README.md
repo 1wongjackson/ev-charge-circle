@@ -25,6 +25,19 @@ npm start
 
 Then open http://localhost:3000.
 
+## Demo data
+
+`npm run seed:demo` adds six demo drivers (`@example.com` emails; the shared password is `DEMO_PASSWORD` in [scripts/seed-demo.js](scripts/seed-demo.js)). It also adds three weeks of charging history, a driver charging right now, two drivers in the queue, and feed activity. The demo drivers use a mix of miles and kilometres.
+
+- `npm run seed:demo -- --reset` removes the demo data and re-adds it fresh (e.g. to refresh "today").
+- `npm run seed:demo -- --remove` removes all demo drivers and their data, and leaves real users untouched.
+
+It writes to `DATABASE_URL` if set, otherwise to the local database. To seed the live site, run it from your own terminal with the Neon connection string:
+
+```bash
+DATABASE_URL="postgresql://..." npm run seed:demo
+```
+
 ## Deploy (Render free + Neon free Postgres)
 
 1. **Database:** create a free project at https://neon.tech and copy its connection string (`postgresql://…?sslmode=require`).

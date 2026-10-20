@@ -2,6 +2,7 @@ import express from 'express';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { all, one, getMeta, setMeta } from './db.js';
+import { hashPassword, verifyPassword } from './passwords.js';
 
 const PORT = Number(process.env.PORT) || 3000;
 // How long the head of the queue has the charger to themselves once it frees up.
@@ -25,18 +26,6 @@ class HttpError extends Error {
 
 const nowIso = () => new Date().toISOString();
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
-
-function hashPassword(password) {
-  const salt = crypto.randomBytes(16);
-  const hash = crypto.scryptSync(password, salt, 64);
-  return `${salt.toString('hex')}:${hash.toString('hex')}`;
-}
-
-function verifyPassword(password, stored) {
-  const [saltHex, hashHex] = stored.split(':');
-  const hash = crypto.scryptSync(password, Buffer.from(saltHex, 'hex'), 64);
-  return crypto.timingSafeEqual(hash, Buffer.from(hashHex, 'hex'));
-}
 
 function parseCookies(req) {
   const out = {};
