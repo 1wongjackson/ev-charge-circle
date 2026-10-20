@@ -203,6 +203,7 @@ async function boot() {
   showApp();
   updateNotifyBtn();
   render();
+  route(); // open a driver profile if the URL points at one
   connectStream();
 }
 
@@ -211,6 +212,7 @@ async function reload() {
     state = await api('/api/state');
     render();
     if (!$('#view-usage').hidden) loadUsage();
+    if (!$('#view-profile').hidden && profileId) loadProfile(profileId);
   } catch {}
 }
 
@@ -278,8 +280,18 @@ function durationPicker(action, label) {
 /** Car thumbnail for a driver id from the current drivers list. */
 function thumbFor(userId, size) {
   const d = state.drivers.find((x) => x.id === userId);
-  return d ? carThumb(d, size) : '';
+  return d ? profileLink(d, carThumb(d, size)) : '';
 }
+
+const profileHref = (id) => `#/driver/${id}`;
+
+/** Wrap a car thumbnail so clicking it opens that driver's profile. */
+function profileLink(d, html) {
+  return `<a class="profile-link" href="${profileHref(d.id)}" aria-label="View ${esc(d.name)}'s profile">${html}</a>`;
+}
+
+/** A driver's name linking to their profile. */
+const nameLink = (id, name) => `<a class="name-link" href="${profileHref(id)}"><strong>${esc(name)}</strong></a>`;
 
 function renderCharger() {
   const { active, reservation, queue } = state.charger;
@@ -439,9 +451,9 @@ function renderDrivers() {
       return `
       <div class="driver ${d.id === state.me.id ? 'me' : ''}">
         <div class="driver-head">
-          ${carThumb(d)}
+          ${profileLink(d, carThumb(d))}
           <div class="driver-id">
-            <div class="driver-name">${esc(d.name)}${d.id === state.me.id ? ' (you)' : ''}</div>
+            <div class="driver-name"><a class="name-link" href="${profileHref(d.id)}">${esc(d.name)}</a>${d.id === state.me.id ? ' (you)' : ''}</div>
             <div class="driver-car">${esc(d.car_model)}</div>
           </div>
         </div>
@@ -576,8 +588,8 @@ $('#broadcast-form').addEventListener('submit', async (e) => {
 });
 
 function eventText(ev) {
-  const a = `<strong>${esc(ev.actor || 'Someone')}</strong>`;
-  const t = `<strong>${esc(ev.target || 'Someone')}</strong>`;
+  const a = ev.user_id ? nameLink(ev.user_id, ev.actor) : '<strong>Someone</strong>';
+  const t = ev.target_user_id ? nameLink(ev.target_user_id, ev.target) : '<strong>Someone</strong>';
   const d = ev.data || {};
   switch (ev.type) {
     case 'registered': return `👋 ${a} joined the community (${esc(d.car_model)})`;
@@ -603,14 +615,144 @@ function renderFeed() {
 
 // ---------- tabs ----------
 
+// Views: the two tabs, plus a driver profile at #/driver/<id>.
+let lastTab = 'community';
+
+function showView(name) {
+  $('#view-community').hidden = name !== 'community';
+  $('#view-usage').hidden = name !== 'usage';
+  $('#view-profile').hidden = name !== 'profile';
+  $$('[data-view]').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
+  if (name === 'usage') loadUsage();
+}
+
+function route() {
+  const match = /^#\/driver\/(\d+)$/.exec(location.hash);
+  if (match) {
+    showView('profile');
+    loadProfile(Number(match[1]));
+    window.scrollTo(0, 0);
+  } else {
+    profileId = null;
+    showView(lastTab);
+  }
+}
+
+window.addEventListener('hashchange', () => state && route());
+
 $$('[data-view]').forEach((btn) =>
   btn.addEventListener('click', () => {
-    $$('[data-view]').forEach((b) => b.classList.toggle('active', b === btn));
-    $('#view-community').hidden = btn.dataset.view !== 'community';
-    $('#view-usage').hidden = btn.dataset.view !== 'usage';
-    if (btn.dataset.view === 'usage') loadUsage();
+    lastTab = btn.dataset.view;
+    if (location.hash) location.hash = ''; // leaving a profile; route() shows the tab
+    else showView(lastTab);
   })
 );
+
+$('.back-link').addEventListener('click', (e) => {
+  e.preventDefault();
+  location.hash = '';
+});
+
+// ---------- driver profile ----------
+
+let profileId = null;
+
+async function loadProfile(id) {
+  const first = profileId !== id;
+  profileId = id;
+  if (first) $('#profile').innerHTML = '<article class="card"><p class="muted">Loading…</p></article>';
+  try {
+    const profile = await api(`/api/users/${id}/profile`);
+    if (profileId === id) renderProfile(profile);
+  } catch (err) {
+    if (profileId === id) $('#profile').innerHTML = `<article class="card"><p class="error">${esc(err.message)}</p></article>`;
+  }
+}
+
+function profileStatus(status) {
+  switch (status.state) {
+    case 'charging':
+      return `<span class="badge busy">⚡ Charging now</span>
+        <span class="muted small-text">since ${fmtTime(status.started_at)} · expects to be done ${fmtTime(status.expected_end)}</span>`;
+    case 'reserved':
+      return `<span class="badge reserved">Up next</span>
+        <span class="muted small-text">the charger is held for them until ${fmtTime(status.until)}</span>`;
+    case 'queued':
+      return `<span class="badge">#${status.position} in the queue</span>
+        <span class="muted small-text">joined ${fmtTime(status.joined_at)}${status.note ? ` · “${esc(status.note)}”` : ''}</span>`;
+    default:
+      return '<span class="badge">Not at the charger</span>';
+  }
+}
+
+const shortTime = (iso) => new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+
+function sessionRow(s) {
+  const end = s.ended_at ? Date.parse(s.ended_at) : Date.now();
+  const date = new Date(s.started_at).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+  const time = `${shortTime(s.started_at)} – ${s.ended_at ? shortTime(s.ended_at) : 'now'}`;
+  const charge = s.start_level != null ? `${s.start_level}% → ${s.end_level != null ? s.end_level + '%' : '…'}` : '—';
+  const done =
+    s.on_time === null ? 'In progress' : s.on_time ? '<span class="ok">✓ On time</span>' : '<span class="late-text">Overstayed</span>';
+  return `<tr><td>${date}</td><td>${time}</td><td class="num">${fmtDuration((end - Date.parse(s.started_at)) / 60000)}</td>
+    <td>${charge}</td><td>${done}</td></tr>`;
+}
+
+function renderProfile({ driver: d, status, stats, sessions, events }) {
+  const isMe = d.id === state.me.id;
+  const lvl = d.charge_level;
+  const fill = lvl < 25 ? 'low' : lvl < 50 ? 'mid' : '';
+  const c = d.car_image;
+  const credit = d.photo_version
+    ? '<p class="credit muted small-text">Photo uploaded by the driver</p>'
+    : c
+      ? `<p class="credit muted small-text">${esc(c.title)} (stock photo) · <a href="${esc(c.file_url)}" target="_blank" rel="noopener">${esc(c.artist)}</a>, ${esc(c.license)}, via Wikimedia Commons</p>`
+      : '';
+  const tile = (k, v) => `<div class="tile"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+  const history = sessions.length
+    ? `<div class="table-wrap"><table>
+        <thead><tr><th>Date</th><th>Time</th><th class="num">Duration</th><th>Charge</th><th>Finished</th></tr></thead>
+        <tbody>${sessions.map(sessionRow).join('')}</tbody></table></div>`
+    : '<p class="empty">No charging sessions yet.</p>';
+  const activity = events.length
+    ? events.map((ev) => `<li>${eventText(ev)}<time>${ago(ev.created_at)}</time></li>`).join('')
+    : '<li class="empty">No activity yet.</li>';
+
+  $('#profile').innerHTML = `
+    <article class="card profile-hero">
+      <div class="profile-photo">${carThumb(d, 'xl')}${credit}</div>
+      <div class="profile-info">
+        <h1>${esc(d.name)}${isMe ? ' <span class="badge">You</span>' : ''}</h1>
+        <p class="profile-car">${esc(d.car_model)}</p>
+        <p class="muted small-text">Member since ${new Date(d.member_since).toLocaleDateString([], { month: 'long', year: 'numeric' })}
+          · status updated ${ago(d.updated_at)}</p>
+        <div class="profile-status">${profileStatus(status)}</div>
+        <div class="battery" role="img" aria-label="Battery ${lvl} percent">
+          <div class="battery-shell"><div class="battery-fill ${fill}" style="width:${lvl}%"></div></div>
+          <div class="battery-cap"></div>
+          <span class="battery-pct">${lvl}%</span>
+        </div>
+        <div class="driver-stats">
+          <div><strong>${showDist(d.est_range_mi)}</strong>${distUnit()} left</div>
+          <div><strong>${showDist(d.daily_miles)}</strong>${distUnit()} / day</div>
+          <div><strong>${d.days_of_range ?? '—'}</strong>days of range</div>
+          <div><strong>${showDist(d.full_range_mi)}</strong>${distUnit()} full range</div>
+        </div>
+        ${isMe ? '<p class="muted small-text">Update your car, charge level and photo under <strong>My car</strong> on the Community tab.</p>' : ''}
+      </div>
+    </article>
+    <div class="tiles">
+      ${tile('Sessions (30 days)', stats.sessions_30d)}
+      ${tile('Hours charged (30 days)', stats.hours_30d.toFixed(1))}
+      ${tile('Average session', stats.avg_minutes != null ? fmtDuration(stats.avg_minutes) : '—')}
+      ${tile('Finished on time', stats.on_time_pct != null ? stats.on_time_pct + '%' : '—')}
+      ${tile('All-time sessions', stats.sessions)}
+    </div>
+    <div class="grid profile-grid">
+      <article class="card"><h3>Recent charging</h3>${history}</article>
+      <article class="card"><h3>Recent activity</h3><ul class="feed">${activity}</ul></article>
+    </div>`;
+}
 
 $$('[data-days]').forEach((btn) =>
   btn.addEventListener('click', () => {

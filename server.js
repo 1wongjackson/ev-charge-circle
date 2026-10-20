@@ -309,21 +309,79 @@ app.post('/api/logout', async (req, res) => {
 
 // ---------- routes: community ----------
 
-app.get('/api/state', auth, async (req, res) => {
-  const users = await all(`SELECT ${userCols()} FROM users ORDER BY name`);
+/** publicUser plus the cached stock photo of each user's car model. */
+async function withCarImages(users) {
   const images = await carImagesFor(users.map((u) => u.car_model), broadcastRefresh);
-  const withImage = (u) => {
+  return users.map((u) => {
     const image = images.get(modelKey(u.car_model));
     return { ...publicUser(u), car_image: image ?? null, car_image_pending: image === undefined };
-  };
-  const drivers = users.map(withImage);
+  });
+}
+
+app.get('/api/state', auth, async (req, res) => {
+  const users = await all(`SELECT ${userCols()} FROM users ORDER BY name`);
+  const drivers = await withCarImages(users);
   const events = (await all(`${eventSelect} ORDER BY e.id DESC LIMIT 60`)).map(formatEvent);
   res.json({
-    me: { ...withImage(req.user), units: req.user.units },
+    me: { ...drivers.find((d) => d.id === req.user.id), units: req.user.units },
     drivers,
     charger: await chargerState(),
     events,
     reserve_minutes: RESERVE_MINUTES,
+  });
+});
+
+// A driver's profile: car, battery, what they're doing at the charger now,
+// charging stats and recent history. Email is never exposed.
+app.get('/api/users/:id/profile', auth, async (req, res) => {
+  const id = Number(req.params.id) || 0;
+  const user = await one(`SELECT ${userCols()} FROM users WHERE id = $1`, [id]);
+  if (!user) throw new HttpError(404, 'Driver not found');
+  const [driver] = await withCarImages([user]);
+
+  const sessions = await all(
+    `SELECT started_at, expected_end, ended_at, start_level, end_level FROM charge_sessions
+     WHERE user_id = $1 ORDER BY started_at DESC LIMIT 2000`,
+    [id]
+  );
+  const now = Date.now();
+  const monthAgo = now - 30 * 24 * 3600_000;
+  const duration = (c) => (c.ended_at ? Date.parse(c.ended_at) : now) - Date.parse(c.started_at);
+  const finished = sessions.filter((c) => c.ended_at);
+  const onTime = finished.filter((c) => Date.parse(c.ended_at) <= Date.parse(c.expected_end) + 10 * 60_000);
+  const recent = sessions.filter((c) => Date.parse(c.started_at) >= monthAgo);
+  const totalMs = sessions.reduce((sum, c) => sum + duration(c), 0);
+  const stats = {
+    sessions: sessions.length,
+    hours: Math.round((totalMs / 3600_000) * 10) / 10,
+    avg_minutes: sessions.length ? Math.round(totalMs / sessions.length / 60_000) : null,
+    on_time_pct: finished.length ? Math.round((onTime.length / finished.length) * 100) : null,
+    sessions_30d: recent.length,
+    hours_30d: Math.round((recent.reduce((sum, c) => sum + duration(c), 0) / 3600_000) * 10) / 10,
+    last_charged: sessions[0]?.started_at ?? null,
+  };
+
+  const charger = await chargerState();
+  const queueIndex = charger.queue.findIndex((q) => q.user_id === id);
+  const status =
+    charger.active?.user_id === id
+      ? { state: 'charging', started_at: charger.active.started_at, expected_end: charger.active.expected_end }
+      : charger.reservation?.user_id === id
+        ? { state: 'reserved', until: charger.reservation.until }
+        : queueIndex >= 0
+          ? { state: 'queued', position: queueIndex + 1, note: charger.queue[queueIndex].note, joined_at: charger.queue[queueIndex].joined_at }
+          : { state: 'idle' };
+
+  const events = (
+    await all(`${eventSelect} WHERE e.user_id = $1 OR e.target_user_id = $1 ORDER BY e.id DESC LIMIT 15`, [id])
+  ).map(formatEvent);
+
+  res.json({
+    driver: { ...driver, member_since: user.created_at },
+    status,
+    stats,
+    sessions: sessions.slice(0, 10).map((c) => ({ ...c, on_time: c.ended_at ? Date.parse(c.ended_at) <= Date.parse(c.expected_end) + 10 * 60_000 : null })),
+    events,
   });
 });
 

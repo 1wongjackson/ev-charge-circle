@@ -76,7 +76,7 @@ function carSvg(model, color) {
 /**
  * Thumbnail HTML for a driver ({ id, name, car_model, car_color, photo_version, car_image }).
  * Priority: their own uploaded photo, then a Wikimedia Commons photo of the
- * model (linked to its file page for the author and licence), then the drawing.
+ * model (credit in the tooltip; the profile page links to the file), then the drawing.
  */
 function carThumb(d, size = '') {
   const label = esc(d.car_model);
@@ -87,9 +87,9 @@ function carThumb(d, size = '') {
   if (d.car_image) {
     const c = d.car_image;
     const credit = `${c.title} · Photo: ${c.artist}, ${c.license}, via Wikimedia Commons`;
-    return `<a class="car-thumb ${size}" href="${esc(c.file_url)}" target="_blank" rel="noopener" title="${esc(credit)}">
+    return `<span class="car-thumb ${size}" title="${esc(credit)}">
       <img src="${esc(c.url)}" alt="${label}" loading="lazy" referrerpolicy="no-referrer"
-           data-model="${label}" data-color="${esc(color)}" /></a>`;
+           data-model="${label}" data-color="${esc(color)}" /></span>`;
   }
   return carIllustration(d.car_model, color, size);
 }
@@ -103,16 +103,16 @@ document.addEventListener(
   'error',
   (e) => {
     const img = e.target;
-    const link = img instanceof HTMLImageElement && img.dataset.model !== undefined && img.closest('a.car-thumb');
-    if (!link) return;
-    const size = [...link.classList].find((c) => c === 'sm' || c === 'lg') || '';
-    link.outerHTML = carIllustration(img.dataset.model, img.dataset.color, size);
+    const thumb = img instanceof HTMLImageElement && img.dataset.model !== undefined && img.closest('.car-thumb');
+    if (!thumb) return;
+    const size = [...thumb.classList].find((c) => ['sm', 'lg', 'xl'].includes(c)) || '';
+    thumb.outerHTML = carIllustration(img.dataset.model, img.dataset.color, size);
   },
   true
 );
 
 /** Crop and shrink an image file to a small JPEG data URL for upload. */
-async function resizeCarPhoto(file, w = 240, h = 160) {
+async function resizeCarPhoto(file, w = 480, h = 320) {
   let bitmap;
   try {
     bitmap = await createImageBitmap(file);
@@ -126,5 +126,10 @@ async function resizeCarPhoto(file, w = 240, h = 160) {
   canvas.width = w;
   canvas.height = h;
   canvas.getContext('2d').drawImage(bitmap, (bitmap.width - sw) / 2, (bitmap.height - sh) / 2, sw, sh, 0, 0, w, h);
-  return canvas.toDataURL('image/jpeg', 0.82);
+  // Step quality down until it fits the server's 60 KB limit (~80k base64 chars).
+  for (const quality of [0.82, 0.72, 0.62, 0.5]) {
+    const url = canvas.toDataURL('image/jpeg', quality);
+    if (url.length < 78_000) return url;
+  }
+  throw new Error('That photo has too much detail to shrink. Try another one.');
 }
