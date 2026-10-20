@@ -182,6 +182,10 @@ label { display: grid; gap: 4px; font-size: 0.88rem; color: var(--ink-2); }
   background: var(--surface-2); object-fit: cover;
 }
 .car-thumb svg { width: 90%; height: auto; display: block; }
+.car-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+a.car-thumb:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.car-note { margin: 0; }
+.credits { margin: 12px 0 0; }
 @media (prefers-color-scheme: dark) {
   .car-thumb .car-body { stroke: #fff; stroke-opacity: 0.35; } /* keeps dark paint visible */
 }

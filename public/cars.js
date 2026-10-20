@@ -73,14 +73,43 @@ function carSvg(model, color) {
   </svg>`;
 }
 
-/** Thumbnail HTML for a driver ({ id, name, car_model, car_color, photo_version }). */
+/**
+ * Thumbnail HTML for a driver ({ id, name, car_model, car_color, photo_version, car_image }).
+ * Priority: their own uploaded photo, then a Wikimedia Commons photo of the
+ * model (linked to its file page for the author and licence), then the drawing.
+ */
 function carThumb(d, size = '') {
   const label = esc(d.car_model);
+  const color = d.car_color || defaultCarColor(d.name);
   if (d.photo_version) {
     return `<img class="car-thumb ${size}" src="/api/users/${d.id}/photo?v=${encodeURIComponent(d.photo_version)}" alt="${label}" loading="lazy" />`;
   }
-  return `<span class="car-thumb ${size}" role="img" aria-label="${label}">${carSvg(d.car_model, d.car_color || defaultCarColor(d.name))}</span>`;
+  if (d.car_image) {
+    const c = d.car_image;
+    const credit = `${c.title} · Photo: ${c.artist}, ${c.license}, via Wikimedia Commons`;
+    return `<a class="car-thumb ${size}" href="${esc(c.file_url)}" target="_blank" rel="noopener" title="${esc(credit)}">
+      <img src="${esc(c.url)}" alt="${label}" loading="lazy" referrerpolicy="no-referrer"
+           data-model="${label}" data-color="${esc(color)}" /></a>`;
+  }
+  return carIllustration(d.car_model, color, size);
 }
+
+function carIllustration(model, color, size = '') {
+  return `<span class="car-thumb ${size}" role="img" aria-label="${esc(model)}">${carSvg(model, color)}</span>`;
+}
+
+// If a Wikimedia photo fails to load, swap in the drawing instead.
+document.addEventListener(
+  'error',
+  (e) => {
+    const img = e.target;
+    const link = img instanceof HTMLImageElement && img.dataset.model !== undefined && img.closest('a.car-thumb');
+    if (!link) return;
+    const size = [...link.classList].find((c) => c === 'sm' || c === 'lg') || '';
+    link.outerHTML = carIllustration(img.dataset.model, img.dataset.color, size);
+  },
+  true
+);
 
 /** Crop and shrink an image file to a small JPEG data URL for upload. */
 async function resizeCarPhoto(file, w = 240, h = 160) {

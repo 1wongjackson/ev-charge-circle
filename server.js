@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { all, one, getMeta, setMeta } from './db.js';
 import { hashPassword, verifyPassword } from './passwords.js';
+import { carImagesFor, modelKey, resolveCarImage } from './carPhotos.js';
 
 const PORT = Number(process.env.PORT) || 3000;
 // How long the head of the queue has the charger to themselves once it frees up.
@@ -186,6 +187,14 @@ async function logEvent(type, userId, data = {}, targetUserId = null) {
   for (const res of streams) res.write(payload);
 }
 
+// Tell every open page to re-fetch (e.g. a car photo finished downloading).
+function broadcastRefresh() {
+  for (const res of streams) res.write('data: {"type":"refresh"}\n\n');
+}
+
+// Look up a model's photo now, so it's ready by the time anyone looks.
+const prefetchCarImage = (model) => resolveCarImage(model).then((found) => found && broadcastRefresh());
+
 // ---------- charger state ----------
 
 const activeSession = () =>
@@ -273,6 +282,7 @@ app.post('/api/register', async (req, res) => {
   if (!created) throw new HttpError(409, 'An account with that email already exists');
   await startSession(res, created.id);
   await logEvent('registered', created.id, { car_model: carModel });
+  prefetchCarImage(carModel);
   res.status(201).json({ ok: true });
 });
 
@@ -300,10 +310,16 @@ app.post('/api/logout', async (req, res) => {
 // ---------- routes: community ----------
 
 app.get('/api/state', auth, async (req, res) => {
-  const drivers = (await all(`SELECT ${userCols()} FROM users ORDER BY name`)).map(publicUser);
+  const users = await all(`SELECT ${userCols()} FROM users ORDER BY name`);
+  const images = await carImagesFor(users.map((u) => u.car_model), broadcastRefresh);
+  const withImage = (u) => {
+    const image = images.get(modelKey(u.car_model));
+    return { ...publicUser(u), car_image: image ?? null, car_image_pending: image === undefined };
+  };
+  const drivers = users.map(withImage);
   const events = (await all(`${eventSelect} ORDER BY e.id DESC LIMIT 60`)).map(formatEvent);
   res.json({
-    me: { ...publicUser(req.user), units: req.user.units },
+    me: { ...withImage(req.user), units: req.user.units },
     drivers,
     charger: await chargerState(),
     events,
@@ -324,6 +340,7 @@ app.put('/api/me', auth, async (req, res) => {
     [charge, daily, fullRange, carModel, color, nowIso(), u.id]
   );
   await logEvent('status', u.id, { charge_level: charge, daily_miles: daily });
+  if (carModel !== u.car_model) prefetchCarImage(carModel);
   res.json({ ok: true });
 });
 

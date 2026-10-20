@@ -478,13 +478,25 @@ function renderMyCar() {
   const f = $('#status-form');
   const me = state.me;
   const color = f.car_color.value || me.car_color || defaultCarColor(me.name);
-  $('#my-car-thumb').innerHTML = carThumb({ ...me, car_model: f.car_model.value || me.car_model, car_color: color }, 'lg');
+  const model = f.car_model.value.trim() || me.car_model;
+  // The stock photo belongs to the saved model; while typing a new one, show the drawing.
+  const stock = model.toLowerCase() === me.car_model.trim().toLowerCase() ? me.car_image : null;
+  $('#my-car-thumb').innerHTML = carThumb({ ...me, car_model: model, car_color: color, car_image: stock }, 'lg');
   $$('#color-swatches .swatch').forEach((s) => {
     s.classList.toggle('active', s.dataset.color === color);
     s.setAttribute('aria-checked', s.dataset.color === color);
   });
-  // A photo replaces the illustration, so the colour only matters without one.
-  $('#color-picker').hidden = Boolean(me.photo_version);
+  // Paint colour only applies to the drawing.
+  $('#color-picker').hidden = Boolean(me.photo_version || stock);
+  $('#car-note').textContent = me.photo_version
+    ? ''
+    : stock
+      ? `Stock photo of the ${stock.title} from Wikipedia. Upload your own to show your car.`
+      : model !== me.car_model
+        ? 'Save to look up a photo of this model.'
+        : me.car_image_pending
+          ? 'Looking up a photo of this model…'
+          : 'No photo found for this model. Check the make and model, or upload your own.';
   $('#photo-remove').hidden = !me.photo_version;
   $('#photo-upload').textContent = me.photo_version ? 'Change photo' : 'Upload a photo';
 }

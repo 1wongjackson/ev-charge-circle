@@ -5,7 +5,7 @@ A small web app for office EV drivers who share one charger.
 - **Accounts**: register and log in with email and password. Passwords are hashed with scrypt, and sessions use an HttpOnly cookie.
 - **Driver dashboard**: every driver's charge %, estimated range, miles per day and days of range left. Drivers who will run out soonest are listed first.
 - **My car**: update your charge level, daily mileage, full-charge range and car model.
-- **Car thumbnails**: each driver gets a side-view illustration of their car. The body style (sedan, SUV, hatchback or pickup) is guessed from the model name, and the driver picks the paint colour. They can also upload a photo of their own car, which the browser shrinks to a small JPEG before uploading.
+- **Car thumbnails**: each driver's card shows a real photo of their declared car model. The app looks it up on Wikipedia/Wikimedia Commons and saves the result per model in the database, crediting each photo's author and licence (hover or tap to see them). Drivers can upload a photo of their own car instead. If no photo is found, the app shows a drawing of the car (sedan, SUV, hatchback or pickup, guessed from the model name) in a colour the driver picks.
 - **Miles or kilometres**: each driver picks their units (mi/km switch in the header, or at sign-up). The choice is saved to their account. Distances are stored in miles and converted for display.
 - **Shared charger**:
   - Plug in and broadcast when you expect to finish (30m–4h, or "done by" a time).
@@ -62,6 +62,7 @@ The free Render plan sleeps after about 15 minutes without traffic. The first vi
 
 - `server.js`: Express API, auth, charger/queue rules, live event stream, overdue checker
 - `db.js`: Postgres connection (or embedded PGlite locally) and schema
+- `carPhotos.js`: finds and caches a Wikimedia Commons photo per car model
 - `render.yaml`: Render deployment blueprint
 - `public/`: the single-page frontend (plain HTML/CSS/JS)
 
