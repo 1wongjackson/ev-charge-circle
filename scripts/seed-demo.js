@@ -5,14 +5,25 @@
 //   npm run seed:demo -- --reset remove all demo data (and re-add it)
 //   npm run seed:demo -- --remove remove all demo data only
 //
-// Uses DATABASE_URL when set (e.g. the Neon database behind the live site),
-// otherwise the local embedded database in data/pglite.
+// Uses DATABASE_URL when set, otherwise the local embedded database in
+// data/pglite. Adding demo drivers to a DATABASE_URL database also needs
+// --production, since anyone with the password can log in as them.
 //
-// All demo drivers share this password and use @example.com emails.
-export const DEMO_PASSWORD = 'evdemo-2026';
+// All demo drivers use @example.com emails and share one password: a fresh
+// random one each run (printed at the end), or DEMO_PASSWORD if set.
 
-import { all, one } from '../db.js';
+import crypto from 'node:crypto';
 import { hashPassword } from '../passwords.js';
+
+const args = process.argv.slice(2);
+if (process.env.DATABASE_URL && !args.includes('--remove') && !args.includes('--production')) {
+  console.error('Refusing to add demo drivers to DATABASE_URL without --production: anyone with the password could log in as them.');
+  process.exit(1);
+}
+// Imported after the check above, since connecting to the database happens on import.
+const { all, one } = await import('../db.js');
+
+const DEMO_PASSWORD = process.env.DEMO_PASSWORD || crypto.randomBytes(12).toString('base64url');
 
 const DEMO_EMAIL = '%@example.com';
 
@@ -25,7 +36,6 @@ const DRIVERS = [
   { name: 'Tom Nguyen', email: 'tom@example.com', color: '#e07a2e', car: 'Chevrolet Bolt EUV', range: 247, charge: 47, daily: 38, units: 'imperial' },
 ];
 
-const args = process.argv.slice(2);
 const MIN = 60_000;
 const now = Date.now();
 const iso = (ms) => new Date(ms).toISOString();
@@ -58,7 +68,7 @@ async function addDemo() {
   }
 
   // --- drivers (joined three weeks ago, statuses updated at various times today)
-  const hash = hashPassword(DEMO_PASSWORD);
+  const hash = await hashPassword(DEMO_PASSWORD);
   const joined = now - 21 * 24 * 60 * MIN;
   const id = {};
   for (const [i, d] of DRIVERS.entries()) {
@@ -133,7 +143,7 @@ async function addDemo() {
 
   console.log(`Added ${DRIVERS.length} demo drivers and ${sessions + 1} past charging sessions.`);
   console.log(`Log in as any of: ${DRIVERS.map((d) => d.email).join(', ')}`);
-  console.log('Password: see DEMO_PASSWORD at the top of scripts/seed-demo.js');
+  console.log(`Password: ${DEMO_PASSWORD}`);
 }
 
 if (args.includes('--remove') || args.includes('--reset')) {

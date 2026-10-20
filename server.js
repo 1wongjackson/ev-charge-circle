@@ -149,19 +149,38 @@ async function auth(req, res, next) {
   next();
 }
 
-// Very small brute-force guard: 10 failed logins per IP per 15 minutes.
-const failedLogins = new Map();
-function checkLoginRate(ip) {
-  const entry = failedLogins.get(ip);
-  if (entry && entry.until > Date.now() && entry.count >= 10) {
-    throw new HttpError(429, 'Too many failed attempts. Try again in a few minutes.');
+// Fixed-window counters, keyed by IP, email or 'all'. In memory, so they reset on restart.
+class RateLimit {
+  constructor(max, windowMs, message) {
+    Object.assign(this, { max, windowMs, message, hits: new Map() });
+  }
+  check(key) {
+    const entry = this.hits.get(key);
+    if (entry && entry.until > Date.now() && entry.count >= this.max) throw new HttpError(429, this.message);
+  }
+  hit(key) {
+    const entry = this.hits.get(key);
+    if (!entry || entry.until < Date.now()) this.hits.set(key, { count: 1, until: Date.now() + this.windowMs });
+    else entry.count++;
+  }
+  reset(key) {
+    this.hits.delete(key);
+  }
+  prune() {
+    for (const [key, entry] of this.hits) if (entry.until < Date.now()) this.hits.delete(key);
   }
 }
-function recordLoginFailure(ip) {
-  const entry = failedLogins.get(ip);
-  if (!entry || entry.until < Date.now()) failedLogins.set(ip, { count: 1, until: Date.now() + 15 * 60_000 });
-  else entry.count++;
-}
+
+const TRY_LATER = 'Too many attempts. Try again in a few minutes.';
+// Brute-force guards: failed logins per IP and per account.
+const failedLoginsByIp = new RateLimit(10, 15 * 60_000, TRY_LATER);
+const failedLoginsByEmail = new RateLimit(5, 15 * 60_000, TRY_LATER);
+// Sign-ups are expensive (scrypt, a broadcast, a Wikipedia lookup), so cap them too.
+const signupsByIp = new RateLimit(5, 60 * 60_000, TRY_LATER);
+const signupsTotal = new RateLimit(50, 60 * 60_000, 'Sign-ups are busy right now. Try again later.');
+const rateLimits = [failedLoginsByIp, failedLoginsByEmail, signupsByIp, signupsTotal];
+
+const MAX_PASSWORD = 128;
 
 // ---------- live events (Server-Sent Events) ----------
 
@@ -259,24 +278,29 @@ async function chargerState() {
 app.get('/healthz', (req, res) => res.send('ok'));
 
 app.post('/api/register', async (req, res) => {
+  signupsByIp.check(req.ip);
+  signupsTotal.check('all');
   const b = req.body || {};
   const name = str(b.name, 'Name', 60);
   const email = str(b.email, 'Email', 120).toLowerCase();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new HttpError(400, 'Enter a valid email');
   const password = typeof b.password === 'string' ? b.password : '';
   if (password.length < 8) throw new HttpError(400, 'Password must be at least 8 characters');
+  if (password.length > MAX_PASSWORD) throw new HttpError(400, `Password must be at most ${MAX_PASSWORD} characters`);
   const carModel = str(b.car_model, 'Car model', 60);
   const fullRange = num(b.full_range_mi, 'Full-charge range', 10, 1000);
   const charge = num(b.charge_level, 'Charge level', 0, 100, 50);
   const daily = num(b.daily_miles, 'Daily mileage', 0, 1000, 30);
   const unitPref = units(b.units, 'imperial');
 
+  signupsByIp.hit(req.ip);
+  signupsTotal.hit('all');
   const now = nowIso();
   const created = await one(
     `INSERT INTO users(name, email, password_hash, car_model, full_range_mi, charge_level, daily_miles, units, updated_at, created_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      ON CONFLICT (email) DO NOTHING RETURNING id`,
-    [name, email, hashPassword(password), carModel, fullRange, charge, daily, unitPref, now, now]
+    [name, email, await hashPassword(password), carModel, fullRange, charge, daily, unitPref, now, now]
   );
   if (!created) throw new HttpError(409, 'An account with that email already exists');
   await startSession(res, created.id);
@@ -286,15 +310,19 @@ app.post('/api/register', async (req, res) => {
 });
 
 app.post('/api/login', async (req, res) => {
-  checkLoginRate(req.ip);
-  const email = String(req.body?.email || '').trim().toLowerCase();
+  const email = String(req.body?.email || '').trim().toLowerCase().slice(0, 120);
   const password = String(req.body?.password || '');
+  failedLoginsByIp.check(req.ip);
+  failedLoginsByEmail.check(email);
   const user = await one(`SELECT ${userCols()} FROM users WHERE email = $1`, [email]);
-  if (!user || !verifyPassword(password, user.password_hash)) {
-    recordLoginFailure(req.ip);
+  // verifyPassword runs scrypt even without a user, so unknown emails aren't faster to reject.
+  if (!(await verifyPassword(password, user?.password_hash))) {
+    failedLoginsByIp.hit(req.ip);
+    failedLoginsByEmail.hit(email);
     throw new HttpError(401, 'Wrong email or password');
   }
-  failedLogins.delete(req.ip);
+  failedLoginsByIp.reset(req.ip);
+  failedLoginsByEmail.reset(email);
   await startSession(res, user.id);
   res.json({ ok: true });
 });
@@ -570,6 +598,7 @@ setInterval(async () => {
       await refreshReservation();
     });
     await all('DELETE FROM sessions WHERE expires_at < $1', [nowIso()]);
+    rateLimits.forEach((limit) => limit.prune());
   } catch (err) {
     console.error('Background job failed', err);
   }

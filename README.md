@@ -2,7 +2,7 @@
 
 A small web app for office EV drivers who share one charger.
 
-- **Accounts**: register and log in with email and password. Passwords are hashed with scrypt, and sessions use an HttpOnly cookie.
+- **Accounts**: register and log in with email and password. Passwords are hashed with scrypt, and sessions use an HttpOnly cookie. Logins and sign-ups are rate-limited per IP (and logins per account).
 - **Driver dashboard**: every driver's charge %, estimated range, miles per day and days of range left. Drivers who will run out soonest are listed first.
 - **Driver profiles**: click any car photo or name (driver cards, queue, charger, feed) to open that driver's profile: a large car photo with credit, their battery and range, whether they are charging or queued right now, 30-day and all-time charging stats, recent sessions (with on-time or overstayed), and recent activity. Profiles have their own link (`#/driver/<id>`), and emails are never shown.
 - **My car**: update your charge level, daily mileage, full-charge range and car model.
@@ -29,15 +29,15 @@ Then open http://localhost:3000.
 
 ## Demo data
 
-`npm run seed:demo` adds six demo drivers (`@example.com` emails; the shared password is `DEMO_PASSWORD` in [scripts/seed-demo.js](scripts/seed-demo.js)). It also adds three weeks of charging history, a driver charging right now, two drivers in the queue, and feed activity. The demo drivers use a mix of miles and kilometres.
+`npm run seed:demo` adds six demo drivers (`@example.com` emails) to the local database. It also adds three weeks of charging history, a driver charging right now, two drivers in the queue, and feed activity. The demo drivers use a mix of miles and kilometres. They share one password, which is random on each run and printed at the end (set `DEMO_PASSWORD` to choose it).
 
-- `npm run seed:demo -- --reset` removes the demo data and re-adds it fresh (e.g. to refresh "today").
+- `npm run seed:demo -- --reset` removes the demo data and re-adds it fresh (e.g. to refresh "today"). This also gives the drivers a new password.
 - `npm run seed:demo -- --remove` removes all demo drivers and their data, and leaves real users untouched.
 
-It writes to `DATABASE_URL` if set, otherwise to the local database. To seed the live site, run it from your own terminal with the Neon connection string:
+**Don't seed a real deployment.** Anyone who has the password could log in as a demo driver, post broadcasts, take queue spots and read history. When `DATABASE_URL` is set, the script refuses to add demo data unless you pass `--production`. If the live database was seeded with an older version (which used a password published in this repo), remove the demo drivers:
 
 ```bash
-DATABASE_URL="postgresql://..." npm run seed:demo
+DATABASE_URL="postgresql://..." npm run seed:demo -- --remove
 ```
 
 ## Deploy (Render free + Neon free Postgres)
