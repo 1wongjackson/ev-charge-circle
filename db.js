@@ -92,7 +92,7 @@ await rawExec(`
 
 export const getMeta = async (key) => (await one('SELECT value FROM meta WHERE key = $1', [key]))?.value ?? null;
 export const setMeta = (key, value) =>
-  all(
-    'INSERT INTO meta(key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = excluded.value',
-    [key, value == null ? null : String(value)]
-  );
+  all('INSERT INTO meta(key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = excluded.value', [
+    key,
+    value == null ? null : String(value),
+  ]);

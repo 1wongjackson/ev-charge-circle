@@ -13,8 +13,8 @@
     <div id="userbar" class="userbar" hidden>
       <span id="charger-pill" class="pill"></span>
       <div class="seg units-toggle" role="group" aria-label="Distance units">
-        <button type="button" data-units="imperial">mi</button>
-        <button type="button" data-units="metric">km</button>
+        <button type="button" data-units="imperial" aria-pressed="false">mi</button>
+        <button type="button" data-units="metric" aria-pressed="false">km</button>
       </div>
       <button id="notify-btn" class="ghost small" type="button">Enable alerts</button>
       <span id="me-name" class="muted"></span>
@@ -28,27 +28,29 @@
       <h1>Share one charger, without the hallway politics.</h1>
       <p class="muted">See who's low on charge, line up for the office charger, and get pinged when it's your turn.</p>
 
-      <div class="tabs" role="tablist">
-        <button class="tab active" data-auth="login" type="button">Log in</button>
-        <button class="tab" data-auth="register" type="button">Register</button>
+      <div class="tabs" role="tablist" aria-label="Account">
+        <button class="tab active" id="tab-login" data-auth="login" type="button" role="tab" aria-selected="true" aria-controls="login-form">Log in</button>
+        <button class="tab" id="tab-register" data-auth="register" type="button" role="tab" aria-selected="false" aria-controls="register-form" tabindex="-1">Register</button>
       </div>
 
-      <form id="login-form" class="form" method="post" action="#">
+      <form id="login-form" class="form" method="post" action="#" role="tabpanel" aria-labelledby="tab-login">
         <label>Email <input name="email" type="email" autocomplete="email" required /></label>
         <label>Password <input name="password" type="password" autocomplete="current-password" required /></label>
         <button type="submit">Log in</button>
       </form>
 
-      <form id="register-form" class="form" method="post" action="#" hidden>
+      <form id="register-form" class="form" method="post" action="#" role="tabpanel" aria-labelledby="tab-register" hidden>
         <label>Name <input name="name" autocomplete="name" required maxlength="60" /></label>
         <label>Email <input name="email" type="email" autocomplete="email" required /></label>
-        <label>Password <input name="password" type="password" autocomplete="new-password" minlength="8" required /></label>
+        <p id="work-email-hint" class="muted small-text field-hint" hidden>Use your work email address.</p>
+        <label>Password <input name="password" type="password" autocomplete="new-password" minlength="8" maxlength="128" required /></label>
+        <label id="invite-field" hidden>Invite code <input name="invite_code" autocomplete="off" /></label>
         <label>Car model <input name="car_model" placeholder="e.g. Tesla Model 3" required maxlength="60" /></label>
         <div class="units-field">
           <span>Distance units</span>
           <div class="seg" role="group" aria-label="Distance units">
-            <button type="button" data-reg-units="imperial">Miles</button>
-            <button type="button" data-reg-units="metric">Kilometres</button>
+            <button type="button" data-reg-units="imperial" aria-pressed="false">Miles</button>
+            <button type="button" data-reg-units="metric" aria-pressed="false">Kilometres</button>
           </div>
         </div>
         <div class="row">
@@ -64,12 +66,13 @@
 
   <!-- ===== App ===== -->
   <main id="app-view" hidden>
-    <nav class="tabs main-tabs" role="tablist">
-      <button class="tab active" data-view="community" type="button">Community</button>
-      <button class="tab" data-view="usage" type="button">Charger usage</button>
+    <div id="conn-banner" class="conn-banner" role="status" hidden>Connection lost — retrying… Live updates are paused.</div>
+    <nav class="tabs main-tabs" role="tablist" aria-label="Sections">
+      <button class="tab active" id="tab-community" data-view="community" type="button" role="tab" aria-selected="true" aria-controls="view-community">Community</button>
+      <button class="tab" id="tab-usage" data-view="usage" type="button" role="tab" aria-selected="false" aria-controls="view-usage" tabindex="-1">Charger usage</button>
     </nav>
 
-    <section id="view-community" class="grid">
+    <section id="view-community" class="grid" role="tabpanel" aria-labelledby="tab-community">
       <div class="col-main">
         <!-- Charger -->
         <article class="card charger" id="charger-card">
@@ -131,13 +134,22 @@
             <button type="submit">Save</button>
             <p id="status-msg" class="muted small-text" role="status"></p>
           </form>
+          <details class="danger-zone">
+            <summary>Delete my account</summary>
+            <form id="delete-form" class="form">
+              <p class="muted small-text">This permanently deletes your account, your charging history and everything you've posted. It can't be undone.</p>
+              <label>Your password <input name="password" type="password" autocomplete="current-password" required /></label>
+              <button type="submit" class="danger">Delete my account</button>
+              <p id="delete-error" class="error" role="alert"></p>
+            </form>
+          </details>
         </article>
 
         <!-- Broadcast + feed -->
         <article class="card">
           <h2>Community feed</h2>
           <form id="broadcast-form" class="broadcast">
-            <input name="message" maxlength="280" placeholder="Broadcast a message…" required />
+            <input name="message" maxlength="280" placeholder="Broadcast a message…" aria-label="Broadcast a message to everyone" required />
             <button type="submit">Send</button>
           </form>
           <ul id="feed" class="feed"></ul>
@@ -150,24 +162,26 @@
       <div id="profile"></div>
     </section>
 
-    <section id="view-usage" hidden>
+    <section id="view-usage" role="tabpanel" aria-labelledby="tab-usage" hidden>
       <div class="usage-head">
         <h2>Charger usage</h2>
         <div class="seg" role="group" aria-label="Time range">
-          <button type="button" data-days="7">7 days</button>
-          <button type="button" data-days="30" class="active">30 days</button>
-          <button type="button" data-days="90">90 days</button>
+          <button type="button" data-days="7" aria-pressed="false">7 days</button>
+          <button type="button" data-days="30" class="active" aria-pressed="true">30 days</button>
+          <button type="button" data-days="90" aria-pressed="false">90 days</button>
         </div>
       </div>
+      <p class="muted small-text">Charts cover everyone. Driver names are only kept with sessions from the last 14 days.</p>
+      <p id="usage-error" class="error" role="alert"></p>
       <div id="usage-tiles" class="tiles"></div>
       <div class="grid usage-grid">
         <article class="card">
-          <h3>Hours charged per day</h3>
-          <div id="chart-daily" class="bars"></div>
+          <h3 id="chart-daily-title">Hours charged per day</h3>
+          <div id="chart-daily" class="bars" role="group" aria-labelledby="chart-daily-title"></div>
         </article>
         <article class="card">
-          <h3>Busiest hours of the day <span class="muted small-text">(total hours in use)</span></h3>
-          <div id="chart-hourly" class="bars"></div>
+          <h3 id="chart-hourly-title">Busiest hours of the day <span class="muted small-text">(total hours in use)</span></h3>
+          <div id="chart-hourly" class="bars" role="group" aria-labelledby="chart-hourly-title"></div>
         </article>
       </div>
       <article class="card">
@@ -178,7 +192,8 @@
   </main>
 
   <div id="tooltip" class="tooltip" hidden></div>
-  <div id="toast" class="toast" hidden></div>
+  <!-- Always in the DOM so screen readers announce what's put in it. -->
+  <div id="toast" class="toast-region" role="status" aria-live="polite"></div>
   <script src="cars.js"></script>
   <script src="app.js"></script>
 </body>

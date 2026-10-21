@@ -1,0 +1,6 @@
+node_modules/
+data/
+package-lock.json
+# Hand-formatted compactly (one CSS rule per line); Prettier would triple their length.
+*.css
+*.html

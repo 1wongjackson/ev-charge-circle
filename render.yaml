@@ -10,7 +10,12 @@ services:
       - key: NODE_ENV
         value: production
       - key: NODE_VERSION
-        value: "22"
+        value: '22'
       # Paste your Neon connection string when Render asks for it.
       - key: DATABASE_URL
+        sync: false
+      # Who may sign up. Set at least one, or anyone with the URL can register.
+      - key: ALLOWED_EMAIL_DOMAINS
+        sync: false
+      - key: SIGNUP_CODE
         sync: false

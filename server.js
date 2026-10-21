@@ -10,6 +10,20 @@ const PORT = Number(process.env.PORT) || 3000;
 const RESERVE_MINUTES = Number(process.env.RESERVE_MINUTES) || 15;
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const COOKIE_SECURE = process.env.NODE_ENV === 'production';
+// Who may sign up: work email domains (comma-separated) and/or a shared invite code.
+const ALLOWED_EMAIL_DOMAINS = (process.env.ALLOWED_EMAIL_DOMAINS || '')
+  .split(',')
+  .map((d) => d.trim().toLowerCase().replace(/^@/, ''))
+  .filter(Boolean);
+const SIGNUP_CODE = process.env.SIGNUP_CODE || '';
+// Charging history names drivers only this far back; older sessions are anonymous.
+const NAMED_HISTORY_DAYS = 14;
+// A charge counts as on time if it ended within this long of the promised end.
+const ON_TIME_GRACE_MS = 10 * 60_000;
+
+if (process.env.NODE_ENV === 'production' && !ALLOWED_EMAIL_DOMAINS.length && !SIGNUP_CODE) {
+  console.warn('Warning: anyone can sign up. Set ALLOWED_EMAIL_DOMAINS and/or SIGNUP_CODE to restrict it.');
+}
 
 const app = express();
 app.set('trust proxy', 1); // behind Render's proxy: real client IP for the login limiter
@@ -30,6 +44,7 @@ class HttpError extends Error {
 
 const nowIso = () => new Date().toISOString();
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
+const safeEqual = (a, b) => crypto.timingSafeEqual(Buffer.from(sha256(a)), Buffer.from(sha256(b)));
 
 function parseCookies(req) {
   const out = {};
@@ -43,7 +58,7 @@ function parseCookies(req) {
 function setSessionCookie(res, token, maxAgeSec) {
   res.setHeader(
     'Set-Cookie',
-    `sid=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAgeSec}${COOKIE_SECURE ? '; Secure' : ''}`
+    `sid=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAgeSec}${COOKIE_SECURE ? '; Secure' : ''}`,
   );
 }
 
@@ -114,8 +129,23 @@ function publicUser(u) {
 
 // Every users column except the photo itself, which is only read by the photo route.
 const userCols = (p = '') =>
-  ['id', 'name', 'email', 'password_hash', 'car_model', 'full_range_mi', 'charge_level', 'daily_miles',
-   'units', 'car_color', 'car_photo_at', 'updated_at', 'created_at'].map((c) => p + c).join(', ');
+  [
+    'id',
+    'name',
+    'email',
+    'password_hash',
+    'car_model',
+    'full_range_mi',
+    'charge_level',
+    'daily_miles',
+    'units',
+    'car_color',
+    'car_photo_at',
+    'updated_at',
+    'created_at',
+  ]
+    .map((c) => p + c)
+    .join(', ');
 
 const CAR_COLORS = ['#f4f5f2', '#1f2224', '#c3c8cc', '#6c757b', '#2f5fb3', '#c0392b', '#2e7d5b', '#e3b23c', '#e07a2e'];
 function carColor(value, fallback) {
@@ -126,13 +156,12 @@ function carColor(value, fallback) {
 
 // Charger/queue changes read-then-write shared state, so run them one at a time.
 let chargerLock = Promise.resolve();
-function serialized(handler) {
-  return (req, res) => {
-    const run = chargerLock.then(() => handler(req, res));
-    chargerLock = run.catch(() => {});
-    return run;
-  };
+function withChargerLock(fn) {
+  const run = chargerLock.then(fn);
+  chargerLock = run.catch(() => {});
+  return run;
 }
+const serialized = (handler) => (req, res) => withChargerLock(() => handler(req, res));
 
 // ---------- auth middleware ----------
 
@@ -143,26 +172,45 @@ async function auth(req, res, next) {
     (await one(
       `SELECT ${userCols('u.')} FROM sessions s JOIN users u ON u.id = s.user_id
        WHERE s.token_hash = $1 AND s.expires_at > $2`,
-      [sha256(token), nowIso()]
+      [sha256(token), nowIso()],
     ));
   if (!user) throw new HttpError(401, 'Please log in');
   req.user = user;
   next();
 }
 
-// Very small brute-force guard: 10 failed logins per IP per 15 minutes.
-const failedLogins = new Map();
-function checkLoginRate(ip) {
-  const entry = failedLogins.get(ip);
-  if (entry && entry.until > Date.now() && entry.count >= 10) {
-    throw new HttpError(429, 'Too many failed attempts. Try again in a few minutes.');
+// Fixed-window counters, keyed by IP, email or 'all'. In memory, so they reset on restart.
+class RateLimit {
+  constructor(max, windowMs, message) {
+    Object.assign(this, { max, windowMs, message, hits: new Map() });
+  }
+  check(key) {
+    const entry = this.hits.get(key);
+    if (entry && entry.until > Date.now() && entry.count >= this.max) throw new HttpError(429, this.message);
+  }
+  hit(key) {
+    const entry = this.hits.get(key);
+    if (!entry || entry.until < Date.now()) this.hits.set(key, { count: 1, until: Date.now() + this.windowMs });
+    else entry.count++;
+  }
+  reset(key) {
+    this.hits.delete(key);
+  }
+  prune() {
+    for (const [key, entry] of this.hits) if (entry.until < Date.now()) this.hits.delete(key);
   }
 }
-function recordLoginFailure(ip) {
-  const entry = failedLogins.get(ip);
-  if (!entry || entry.until < Date.now()) failedLogins.set(ip, { count: 1, until: Date.now() + 15 * 60_000 });
-  else entry.count++;
-}
+
+const TRY_LATER = 'Too many attempts. Try again in a few minutes.';
+// Brute-force guards: failed logins per IP and per account.
+const failedLoginsByIp = new RateLimit(10, 15 * 60_000, TRY_LATER);
+const failedLoginsByEmail = new RateLimit(5, 15 * 60_000, TRY_LATER);
+// Sign-ups are expensive (scrypt, a broadcast, a Wikipedia lookup), so cap them too.
+const signupsByIp = new RateLimit(5, 60 * 60_000, TRY_LATER);
+const signupsTotal = new RateLimit(50, 60 * 60_000, 'Sign-ups are busy right now. Try again later.');
+const rateLimits = [failedLoginsByIp, failedLoginsByEmail, signupsByIp, signupsTotal];
+
+const MAX_PASSWORD = 128;
 
 // ---------- live events (Server-Sent Events) ----------
 
@@ -180,7 +228,7 @@ const formatEvent = (e) => ({ ...e, data: JSON.parse(e.data) });
 async function logEvent(type, userId, data = {}, targetUserId = null) {
   const { id } = await one(
     'INSERT INTO events(type, user_id, target_user_id, data, created_at) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-    [type, userId, targetUserId, JSON.stringify(data), nowIso()]
+    [type, userId, targetUserId, JSON.stringify(data), nowIso()],
   );
   const event = formatEvent(await one(`${eventSelect} WHERE e.id = $1`, [id]));
   const payload = `data: ${JSON.stringify(event)}\n\n`;
@@ -200,7 +248,7 @@ const prefetchCarImage = (model) => resolveCarImage(model).then((found) => found
 const activeSession = () =>
   one(
     `SELECT c.*, u.name, u.car_model FROM charge_sessions c
-     JOIN users u ON u.id = c.user_id WHERE c.ended_at IS NULL`
+     JOIN users u ON u.id = c.user_id WHERE c.ended_at IS NULL`,
   );
 
 const queueRows = () =>
@@ -208,7 +256,7 @@ const queueRows = () =>
     `SELECT q.user_id, q.joined_at, q.note, u.name, u.car_model, u.charge_level,
             u.daily_miles, u.full_range_mi
      FROM queue q JOIN users u ON u.id = q.user_id
-     ORDER BY q.joined_at, q.user_id`
+     ORDER BY q.joined_at, q.user_id`,
   );
 
 // When the charger is free and someone is waiting, hold it for the head of the
@@ -259,25 +307,41 @@ async function chargerState() {
 
 app.get('/healthz', (req, res) => res.send('ok'));
 
+// What the sign-up form needs to ask for. The allowed domains aren't revealed.
+app.get('/api/signup-info', (req, res) => {
+  res.json({ invite_code: Boolean(SIGNUP_CODE), work_email: ALLOWED_EMAIL_DOMAINS.length > 0 });
+});
+
 app.post('/api/register', async (req, res) => {
+  signupsByIp.check(req.ip);
+  signupsTotal.check('all');
   const b = req.body || {};
   const name = str(b.name, 'Name', 60);
   const email = str(b.email, 'Email', 120).toLowerCase();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new HttpError(400, 'Enter a valid email');
+  if (ALLOWED_EMAIL_DOMAINS.length && !ALLOWED_EMAIL_DOMAINS.includes(email.split('@')[1])) {
+    throw new HttpError(403, 'Sign up with your work email address');
+  }
+  if (SIGNUP_CODE && !safeEqual(String(b.invite_code || '').trim(), SIGNUP_CODE)) {
+    throw new HttpError(403, 'That invite code is not right. Ask a colleague for it.');
+  }
   const password = typeof b.password === 'string' ? b.password : '';
   if (password.length < 8) throw new HttpError(400, 'Password must be at least 8 characters');
+  if (password.length > MAX_PASSWORD) throw new HttpError(400, `Password must be at most ${MAX_PASSWORD} characters`);
   const carModel = str(b.car_model, 'Car model', 60);
   const fullRange = num(b.full_range_mi, 'Full-charge range', 10, 1000);
   const charge = num(b.charge_level, 'Charge level', 0, 100, 50);
   const daily = num(b.daily_miles, 'Daily mileage', 0, 1000, 30);
   const unitPref = units(b.units, 'imperial');
 
+  signupsByIp.hit(req.ip);
+  signupsTotal.hit('all');
   const now = nowIso();
   const created = await one(
     `INSERT INTO users(name, email, password_hash, car_model, full_range_mi, charge_level, daily_miles, units, updated_at, created_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      ON CONFLICT (email) DO NOTHING RETURNING id`,
-    [name, email, hashPassword(password), carModel, fullRange, charge, daily, unitPref, now, now]
+    [name, email, await hashPassword(password), carModel, fullRange, charge, daily, unitPref, now, now],
   );
   if (!created) throw new HttpError(409, 'An account with that email already exists');
   await startSession(res, created.id);
@@ -287,15 +351,22 @@ app.post('/api/register', async (req, res) => {
 });
 
 app.post('/api/login', async (req, res) => {
-  checkLoginRate(req.ip);
-  const email = String(req.body?.email || '').trim().toLowerCase();
+  const email = String(req.body?.email || '')
+    .trim()
+    .toLowerCase()
+    .slice(0, 120);
   const password = String(req.body?.password || '');
+  failedLoginsByIp.check(req.ip);
+  failedLoginsByEmail.check(email);
   const user = await one(`SELECT ${userCols()} FROM users WHERE email = $1`, [email]);
-  if (!user || !verifyPassword(password, user.password_hash)) {
-    recordLoginFailure(req.ip);
+  // verifyPassword runs scrypt even without a user, so unknown emails aren't faster to reject.
+  if (!(await verifyPassword(password, user?.password_hash))) {
+    failedLoginsByIp.hit(req.ip);
+    failedLoginsByEmail.hit(email);
     throw new HttpError(401, 'Wrong email or password');
   }
-  failedLogins.delete(req.ip);
+  failedLoginsByIp.reset(req.ip);
+  failedLoginsByEmail.reset(email);
   await startSession(res, user.id);
   res.json({ ok: true });
 });
@@ -311,7 +382,10 @@ app.post('/api/logout', async (req, res) => {
 
 /** publicUser plus the cached stock photo of each user's car model. */
 async function withCarImages(users) {
-  const images = await carImagesFor(users.map((u) => u.car_model), broadcastRefresh);
+  const images = await carImagesFor(
+    users.map((u) => u.car_model),
+    broadcastRefresh,
+  );
   return users.map((u) => {
     const image = images.get(modelKey(u.car_model));
     return { ...publicUser(u), car_image: image ?? null, car_image_pending: image === undefined };
@@ -342,13 +416,14 @@ app.get('/api/users/:id/profile', auth, async (req, res) => {
   const sessions = await all(
     `SELECT started_at, expected_end, ended_at, start_level, end_level FROM charge_sessions
      WHERE user_id = $1 ORDER BY started_at DESC LIMIT 2000`,
-    [id]
+    [id],
   );
   const now = Date.now();
   const monthAgo = now - 30 * 24 * 3600_000;
   const duration = (c) => (c.ended_at ? Date.parse(c.ended_at) : now) - Date.parse(c.started_at);
   const finished = sessions.filter((c) => c.ended_at);
-  const onTime = finished.filter((c) => Date.parse(c.ended_at) <= Date.parse(c.expected_end) + 10 * 60_000);
+  const isOnTime = (c) => Date.parse(c.ended_at) <= Date.parse(c.expected_end) + ON_TIME_GRACE_MS;
+  const onTime = finished.filter(isOnTime);
   const recent = sessions.filter((c) => Date.parse(c.started_at) >= monthAgo);
   const totalMs = sessions.reduce((sum, c) => sum + duration(c), 0);
   const stats = {
@@ -369,7 +444,12 @@ app.get('/api/users/:id/profile', auth, async (req, res) => {
       : charger.reservation?.user_id === id
         ? { state: 'reserved', until: charger.reservation.until }
         : queueIndex >= 0
-          ? { state: 'queued', position: queueIndex + 1, note: charger.queue[queueIndex].note, joined_at: charger.queue[queueIndex].joined_at }
+          ? {
+              state: 'queued',
+              position: queueIndex + 1,
+              note: charger.queue[queueIndex].note,
+              joined_at: charger.queue[queueIndex].joined_at,
+            }
           : { state: 'idle' };
 
   const events = (
@@ -380,7 +460,12 @@ app.get('/api/users/:id/profile', auth, async (req, res) => {
     driver: { ...driver, member_since: user.created_at },
     status,
     stats,
-    sessions: sessions.slice(0, 10).map((c) => ({ ...c, on_time: c.ended_at ? Date.parse(c.ended_at) <= Date.parse(c.expected_end) + 10 * 60_000 : null })),
+    // Exact times only for recent sessions (all of them on your own profile).
+    sessions: sessions
+      .filter((c) => id === req.user.id || Date.parse(c.started_at) >= now - NAMED_HISTORY_DAYS * 24 * 3600_000)
+      .slice(0, 10)
+      .map((c) => ({ ...c, on_time: c.ended_at ? isOnTime(c) : null })),
+    named_history_days: NAMED_HISTORY_DAYS,
     events,
   });
 });
@@ -395,7 +480,7 @@ app.put('/api/me', auth, async (req, res) => {
   const color = carColor(b.car_color, u.car_color);
   await all(
     'UPDATE users SET charge_level = $1, daily_miles = $2, full_range_mi = $3, car_model = $4, car_color = $5, updated_at = $6 WHERE id = $7',
-    [charge, daily, fullRange, carModel, color, nowIso(), u.id]
+    [charge, daily, fullRange, carModel, color, nowIso(), u.id],
   );
   await logEvent('status', u.id, { charge_level: charge, daily_miles: daily });
   if (carModel !== u.car_model) prefetchCarImage(carModel);
@@ -433,6 +518,25 @@ app.put('/api/me/preferences', auth, async (req, res) => {
   res.json({ ok: true, units: unitPref });
 });
 
+// Deletes the account and everything tied to it: charging history, queue spot,
+// sessions, and every feed event by or about this driver.
+app.delete(
+  '/api/me',
+  auth,
+  serialized(async (req, res) => {
+    const stored = await one('SELECT password_hash FROM users WHERE id = $1', [req.user.id]);
+    if (!(await verifyPassword(String(req.body?.password || ''), stored?.password_hash))) {
+      throw new HttpError(403, 'Wrong password');
+    }
+    await all('DELETE FROM events WHERE user_id = $1 OR target_user_id = $1', [req.user.id]);
+    await all('DELETE FROM users WHERE id = $1', [req.user.id]); // cascades sessions, charging history, queue
+    await refreshReservation();
+    broadcastRefresh();
+    setSessionCookie(res, '', 0);
+    res.json({ ok: true });
+  }),
+);
+
 app.post('/api/broadcast', auth, async (req, res) => {
   const message = str(req.body?.message, 'Message', 280);
   await logEvent('message', req.user.id, { message });
@@ -441,83 +545,134 @@ app.post('/api/broadcast', auth, async (req, res) => {
 
 // ---------- routes: the shared charger ----------
 
-app.post('/api/charger/start', auth, serialized(async (req, res) => {
-  const expectedEnd = futureTime(req.body?.expected_end);
-  const me = req.user;
-  if (await activeSession()) throw new HttpError(409, 'The charger is already in use');
-  const { reservation } = await chargerState();
-  if (reservation && reservation.user_id !== me.id) {
-    throw new HttpError(409, `The charger is reserved for ${reservation.name} (next in the queue) for a few more minutes`);
-  }
-  await all('INSERT INTO charge_sessions(user_id, started_at, expected_end, start_level) VALUES ($1, $2, $3, $4)', [
-    me.id,
-    nowIso(),
-    expectedEnd,
-    me.charge_level,
-  ]);
-  await all('DELETE FROM queue WHERE user_id = $1', [me.id]);
-  await logEvent('start', me.id, { expected_end: expectedEnd, charge_level: me.charge_level });
-  await refreshReservation();
-  res.json(await chargerState());
-}));
+app.post(
+  '/api/charger/start',
+  auth,
+  serialized(async (req, res) => {
+    const expectedEnd = futureTime(req.body?.expected_end);
+    const me = req.user;
+    if (await activeSession()) throw new HttpError(409, 'The charger is already in use');
+    const { reservation } = await chargerState();
+    if (reservation && reservation.user_id !== me.id) {
+      throw new HttpError(
+        409,
+        `The charger is reserved for ${reservation.name} (next in the queue) for a few more minutes`,
+      );
+    }
+    await all('INSERT INTO charge_sessions(user_id, started_at, expected_end, start_level) VALUES ($1, $2, $3, $4)', [
+      me.id,
+      nowIso(),
+      expectedEnd,
+      me.charge_level,
+    ]);
+    await all('DELETE FROM queue WHERE user_id = $1', [me.id]);
+    await logEvent('start', me.id, { expected_end: expectedEnd, charge_level: me.charge_level });
+    await refreshReservation();
+    res.json(await chargerState());
+  }),
+);
 
-app.post('/api/charger/update', auth, serialized(async (req, res) => {
-  const expectedEnd = futureTime(req.body?.expected_end);
-  const active = await activeSession();
-  if (!active || active.user_id !== req.user.id) throw new HttpError(403, "You're not the one charging right now");
-  await all('UPDATE charge_sessions SET expected_end = $1, overdue_notified = FALSE WHERE id = $2', [expectedEnd, active.id]);
-  await logEvent('extend', req.user.id, { expected_end: expectedEnd });
-  res.json(await chargerState());
-}));
+app.post(
+  '/api/charger/update',
+  auth,
+  serialized(async (req, res) => {
+    const expectedEnd = futureTime(req.body?.expected_end);
+    const active = await activeSession();
+    if (!active || active.user_id !== req.user.id) throw new HttpError(403, "You're not the one charging right now");
+    await all('UPDATE charge_sessions SET expected_end = $1, overdue_notified = FALSE WHERE id = $2', [
+      expectedEnd,
+      active.id,
+    ]);
+    await logEvent('extend', req.user.id, { expected_end: expectedEnd });
+    res.json(await chargerState());
+  }),
+);
 
-app.post('/api/charger/end', auth, serialized(async (req, res) => {
-  const active = await activeSession();
-  if (!active || active.user_id !== req.user.id) throw new HttpError(403, "You're not the one charging right now");
-  const endLevel = num(req.body?.end_level, 'Charge level', 0, 100, null);
-  const now = nowIso();
-  await all('UPDATE charge_sessions SET ended_at = $1, end_level = $2 WHERE id = $3', [now, endLevel, active.id]);
-  if (endLevel !== null) {
-    await all('UPDATE users SET charge_level = $1, updated_at = $2 WHERE id = $3', [endLevel, now, req.user.id]);
-  }
-  const minutes = Math.round((Date.parse(now) - Date.parse(active.started_at)) / 60_000);
-  await logEvent('end', req.user.id, { minutes, end_level: endLevel });
-  await refreshReservation();
-  res.json(await chargerState());
-}));
+app.post(
+  '/api/charger/end',
+  auth,
+  serialized(async (req, res) => {
+    const active = await activeSession();
+    if (!active || active.user_id !== req.user.id) throw new HttpError(403, "You're not the one charging right now");
+    const endLevel = num(req.body?.end_level, 'Charge level', 0, 100, null);
+    const now = nowIso();
+    await all('UPDATE charge_sessions SET ended_at = $1, end_level = $2 WHERE id = $3', [now, endLevel, active.id]);
+    if (endLevel !== null) {
+      await all('UPDATE users SET charge_level = $1, updated_at = $2 WHERE id = $3', [endLevel, now, req.user.id]);
+    }
+    const minutes = Math.round((Date.parse(now) - Date.parse(active.started_at)) / 60_000);
+    await logEvent('end', req.user.id, { minutes, end_level: endLevel });
+    await refreshReservation();
+    res.json(await chargerState());
+  }),
+);
 
-app.post('/api/queue/join', auth, serialized(async (req, res) => {
-  const note = str(req.body?.note, 'Note', 140, { optional: true });
-  if ((await activeSession())?.user_id === req.user.id) throw new HttpError(409, "You're already charging");
-  const joined = await one(
-    'INSERT INTO queue(user_id, joined_at, note) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO NOTHING RETURNING user_id',
-    [req.user.id, nowIso(), note]
-  );
-  if (!joined) throw new HttpError(409, "You're already in the queue");
-  await logEvent('queue_join', req.user.id, { note });
-  await refreshReservation();
-  res.json(await chargerState());
-}));
+app.post(
+  '/api/queue/join',
+  auth,
+  serialized(async (req, res) => {
+    const note = str(req.body?.note, 'Note', 140, { optional: true });
+    if ((await activeSession())?.user_id === req.user.id) throw new HttpError(409, "You're already charging");
+    const joined = await one(
+      'INSERT INTO queue(user_id, joined_at, note) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO NOTHING RETURNING user_id',
+      [req.user.id, nowIso(), note],
+    );
+    if (!joined) throw new HttpError(409, "You're already in the queue");
+    await logEvent('queue_join', req.user.id, { note });
+    await refreshReservation();
+    res.json(await chargerState());
+  }),
+);
 
-app.post('/api/queue/leave', auth, serialized(async (req, res) => {
-  const left = await one('DELETE FROM queue WHERE user_id = $1 RETURNING user_id', [req.user.id]);
-  if (!left) throw new HttpError(409, "You're not in the queue");
-  await logEvent('queue_leave', req.user.id);
-  await refreshReservation();
-  res.json(await chargerState());
-}));
+app.post(
+  '/api/queue/leave',
+  auth,
+  serialized(async (req, res) => {
+    const left = await one('DELETE FROM queue WHERE user_id = $1 RETURNING user_id', [req.user.id]);
+    if (!left) throw new HttpError(409, "You're not in the queue");
+    await logEvent('queue_leave', req.user.id);
+    await refreshReservation();
+    res.json(await chargerState());
+  }),
+);
 
-// Charging history for the usage view; aggregation happens client-side so
-// days and hours are bucketed in the viewer's local time zone.
+// Charging history for the usage view. Charts are bucketed client-side so days
+// and hours land in the viewer's local time zone. Timestamps say when people
+// are in the office, so sessions older than NAMED_HISTORY_DAYS come without
+// names; per-driver numbers are totals only.
 app.get('/api/sessions', auth, async (req, res) => {
-  const days = num(req.query.days, 'Days', 1, 365, 30);
-  const since = new Date(Date.now() - days * 24 * 3600_000).toISOString();
+  const days = num(req.query.days, 'Days', 1, 90, 30);
+  const now = Date.now();
+  const since = new Date(now - days * 24 * 3600_000).toISOString();
+  const namedSince = new Date(now - NAMED_HISTORY_DAYS * 24 * 3600_000).toISOString();
   const rows = await all(
-    `SELECT c.id, c.user_id, u.name, c.started_at, c.expected_end, c.ended_at, c.start_level, c.end_level
+    `SELECT c.user_id, u.name, c.started_at, c.expected_end, c.ended_at
      FROM charge_sessions c JOIN users u ON u.id = c.user_id
      WHERE COALESCE(c.ended_at, '9999') >= $1 ORDER BY c.started_at`,
-    [since]
+    [since],
   );
-  res.json({ since, sessions: rows });
+
+  const drivers = new Map();
+  for (const c of rows) {
+    const ms = (c.ended_at ? Date.parse(c.ended_at) : now) - Math.max(Date.parse(c.started_at), Date.parse(since));
+    const late = Boolean(c.ended_at) && Date.parse(c.ended_at) > Date.parse(c.expected_end) + ON_TIME_GRACE_MS;
+    const d = drivers.get(c.user_id) || {
+      user_id: c.user_id,
+      name: c.name,
+      count: 0,
+      ms: 0,
+      late: 0,
+      last: c.started_at,
+    };
+    d.count++;
+    d.ms += Math.max(0, ms);
+    if (late) d.late++;
+    if (c.started_at > d.last) d.last = c.started_at;
+    drivers.set(c.user_id, d);
+  }
+
+  const sessions = rows.map(({ user_id, name, ...c }) => (c.started_at >= namedSince ? { user_id, name, ...c } : c));
+  res.json({ since, named_since: namedSince, sessions, drivers: [...drivers.values()] });
 });
 
 app.get('/api/stream', auth, (req, res) => {
@@ -538,7 +693,7 @@ app.get('/api/stream', auth, (req, res) => {
 
 app.use('/api', (req, res, next) => next(new HttpError(404, 'Not found')));
 
-app.use((err, req, res, next) => {
+app.use((err, req, res, _next) => {
   const status = err.status || (err.type === 'entity.parse.failed' ? 400 : 500);
   if (status >= 500) console.error(err);
   res.status(status).json({ error: status >= 500 ? 'Something went wrong' : err.message });
@@ -549,12 +704,29 @@ app.use((err, req, res, next) => {
 setInterval(async () => {
   try {
     // Nudge the driver (and everyone waiting) when the promised end time passes.
-    const active = await activeSession();
-    if (active && !active.overdue_notified && active.expected_end < nowIso()) {
-      await all('UPDATE charge_sessions SET overdue_notified = TRUE WHERE id = $1', [active.id]);
-      await logEvent('overdue', null, { expected_end: active.expected_end }, active.user_id);
-    }
+    // One conditional update, so an end or extend racing this can't be clobbered.
+    const overdue = await one(
+      `UPDATE charge_sessions SET overdue_notified = TRUE
+       WHERE ended_at IS NULL AND NOT overdue_notified AND expected_end < $1
+       RETURNING user_id, expected_end`,
+      [nowIso()],
+    );
+    if (overdue) await logEvent('overdue', null, { expected_end: overdue.expected_end }, overdue.user_id);
+
+    // If the head of the queue let their hold lapse, drop them so the charger
+    // passes to the next driver instead of sitting idle.
+    await withChargerLock(async () => {
+      const reservedFor = Number(await getMeta('reserved_for'));
+      const reservedUntil = await getMeta('reserved_until');
+      if (!reservedFor || !reservedUntil || reservedUntil >= nowIso() || (await activeSession())) return;
+      const [head] = await queueRows();
+      if (head?.user_id !== reservedFor) return;
+      await all('DELETE FROM queue WHERE user_id = $1', [reservedFor]);
+      await logEvent('queue_skipped', null, { until: reservedUntil }, reservedFor);
+      await refreshReservation();
+    });
     await all('DELETE FROM sessions WHERE expires_at < $1', [nowIso()]);
+    rateLimits.forEach((limit) => limit.prune());
   } catch (err) {
     console.error('Background job failed', err);
   }

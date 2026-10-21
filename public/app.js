@@ -1,4 +1,5 @@
 'use strict';
+/* global CAR_COLORS, carThumb, defaultCarColor, resizeCarPhoto -- from cars.js, loaded first */
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
@@ -7,6 +8,9 @@ let state = null; // latest /api/state payload
 let stream = null;
 let statusDirty = false;
 let usageDays = 30;
+let profileId = null; // driver whose profile is open
+let retryTimer; // pending live-feed reconnect
+let retryDelay = 2000;
 
 // ---------- units ----------
 // Distances are stored in miles; 'metric' only changes what's shown and typed.
@@ -19,7 +23,9 @@ function guessUnits() {
   try {
     const saved = localStorage.getItem('units');
     if (saved === 'imperial' || saved === 'metric') return saved;
-  } catch {}
+  } catch {
+    // storage blocked (e.g. private mode): fall back to the locale
+  }
   const region = (navigator.language || '').split('-')[1]?.toUpperCase();
   return IMPERIAL_REGIONS.includes(region) ? 'imperial' : 'metric';
 }
@@ -31,11 +37,13 @@ const showDist = (mi) => Math.round(units === 'metric' ? mi * KM_PER_MI : mi);
 const inputToMiles = (v) => (v === '' || v == null ? v : units === 'metric' ? Number(v) / KM_PER_MI : Number(v));
 
 function applyUnits() {
-  try { localStorage.setItem('units', units); } catch {}
+  try {
+    localStorage.setItem('units', units);
+  } catch {
+    // storage blocked: the choice still lasts for this page
+  }
   $$('.u-dist').forEach((el) => (el.textContent = distUnit()));
-  $$('[data-units], [data-reg-units]').forEach((b) =>
-    b.classList.toggle('active', (b.dataset.units || b.dataset.regUnits) === units)
-  );
+  $$('[data-units], [data-reg-units]').forEach((b) => setPressed(b, (b.dataset.units || b.dataset.regUnits) === units));
   // Server limits are 1000 mi; keep the input limits equivalent.
   const max = units === 'metric' ? 1600 : 1000;
   $$('input[name="full_range_mi"], input[name="daily_miles"]').forEach((i) => (i.max = max));
@@ -53,7 +61,10 @@ function convertDistInputs(form, from, to) {
 // ---------- utilities ----------
 
 function esc(s) {
-  return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+  return String(s ?? '').replace(
+    /[&<>"']/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c],
+  );
 }
 
 async function api(url, { method = 'GET', body } = {}) {
@@ -92,16 +103,57 @@ function ago(iso) {
   return `${Math.round(min / 1440)}d ago`;
 }
 
-function toast(text) {
-  const el = $('#toast');
-  el.textContent = text;
-  el.hidden = false;
-  clearTimeout(toast.t);
-  toast.t = setTimeout(() => (el.hidden = true), 5000);
+/** Mark a toggle button as on/off, for both the styling and screen readers. */
+function setPressed(btn, on) {
+  btn.classList.toggle('active', on);
+  btn.setAttribute('aria-pressed', on);
 }
 
+/** Mark a tab as the selected one in its tablist. */
+function selectTab(tab, on) {
+  tab.classList.toggle('active', on);
+  tab.setAttribute('aria-selected', on);
+  tab.tabIndex = on ? 0 : -1;
+}
+
+// Arrow keys move between tabs, as in any tablist.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  const tab = e.target.closest?.('[role="tab"]');
+  if (!tab) return;
+  const tabs = [...tab.parentElement.querySelectorAll('[role="tab"]')];
+  const next = tabs[(tabs.indexOf(tab) + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length];
+  next.focus();
+  next.click();
+});
+
+/**
+ * Show a message at the bottom of the screen. The region is aria-live, so
+ * screen readers announce it. Sticky messages stay until dismissed.
+ */
+function toast(text, { sticky = false } = {}) {
+  const el = $('#toast');
+  el.innerHTML = `<div class="toast"><span>${esc(text)}</span><button type="button" class="toast-close" aria-label="Dismiss">✕</button></div>`;
+  clearTimeout(toast.t);
+  if (!sticky) toast.t = setTimeout(() => (el.innerHTML = ''), 6000);
+}
+$('#toast').addEventListener('click', (e) => {
+  if (e.target.closest('.toast-close')) $('#toast').innerHTML = '';
+});
+
+/** Disable a set of buttons while fn runs, so a double-click can't send it twice. */
+async function whileBusy(buttons, fn) {
+  buttons.forEach((b) => (b.disabled = true));
+  try {
+    return await fn();
+  } finally {
+    buttons.forEach((b) => (b.disabled = false));
+  }
+}
+
+// Alerts about your turn at the charger: they matter, so they stay until dismissed.
 function notify(text) {
-  toast(text);
+  toast(text, { sticky: true });
   if ('Notification' in window && Notification.permission === 'granted') {
     new Notification('EV Charge Circle', { body: text });
   }
@@ -113,6 +165,8 @@ function showAuth() {
   state = null;
   stream?.close();
   stream = null;
+  clearTimeout(retryTimer);
+  setOffline(false);
   $('#auth-view').hidden = false;
   $('#app-view').hidden = true;
   $('#userbar').hidden = true;
@@ -126,11 +180,11 @@ function showApp() {
 
 $$('[data-auth]').forEach((btn) =>
   btn.addEventListener('click', () => {
-    $$('[data-auth]').forEach((b) => b.classList.toggle('active', b === btn));
+    $$('[data-auth]').forEach((b) => selectTab(b, b === btn));
     $('#login-form').hidden = btn.dataset.auth !== 'login';
     $('#register-form').hidden = btn.dataset.auth !== 'register';
     $('#auth-error').textContent = '';
-  })
+  }),
 );
 
 async function submitAuth(e, url) {
@@ -143,7 +197,9 @@ async function submitAuth(e, url) {
     body.units = units;
   }
   try {
-    await api(url, { method: 'POST', body });
+    await whileBusy([e.submitter || e.target.querySelector('[type="submit"]')], () =>
+      api(url, { method: 'POST', body }),
+    );
     e.target.reset();
     await boot();
   } catch (err) {
@@ -155,7 +211,7 @@ $$('[data-reg-units]').forEach((btn) =>
     convertDistInputs($('#register-form'), units, btn.dataset.regUnits);
     units = btn.dataset.regUnits;
     applyUnits();
-  })
+  }),
 );
 
 $$('[data-units]').forEach((btn) =>
@@ -167,8 +223,17 @@ $$('[data-units]').forEach((btn) =>
     render();
     if (!$('#view-usage').hidden) loadUsage();
     await api('/api/me/preferences', { method: 'PUT', body: { units } }).catch((err) => toast(err.message));
-  })
+  }),
 );
+
+// Ask for an invite code / work email only when the server requires one.
+api('/api/signup-info')
+  .then((info) => {
+    $('#invite-field').hidden = !info.invite_code;
+    $('#invite-field input').required = info.invite_code;
+    $('#work-email-hint').hidden = !info.work_email;
+  })
+  .catch(() => {}); // the server will say what's missing on submit
 
 $('#login-form').addEventListener('submit', (e) => submitAuth(e, '/api/login'));
 $('#register-form').addEventListener('submit', (e) => submitAuth(e, '/api/register'));
@@ -207,13 +272,23 @@ async function boot() {
   connectStream();
 }
 
+// Shown whenever the live feed or a refresh fails, so nobody acts on stale data.
+function setOffline(offline) {
+  $('#conn-banner').hidden = !offline;
+}
+
 async function reload() {
   try {
     state = await api('/api/state');
-    render();
-    if (!$('#view-usage').hidden) loadUsage();
-    if (!$('#view-profile').hidden && profileId) loadProfile(profileId);
-  } catch {}
+  } catch {
+    // A 401 already sent us back to the login screen; anything else means we're out of date.
+    if (state) setOffline(true);
+    return;
+  }
+  if (stream?.readyState === EventSource.OPEN) setOffline(false);
+  render();
+  if (!$('#view-usage').hidden) loadUsage();
+  if (!$('#view-profile').hidden && profileId) loadProfile(profileId);
 }
 
 let reloadTimer;
@@ -222,14 +297,36 @@ const scheduleReload = () => {
   reloadTimer = setTimeout(reload, 150);
 };
 
+// EventSource retries on its own after a dropped connection, but gives up for
+// good on an error response (e.g. a 502 while the server restarts). Then we
+// retry ourselves, backing off, via /api/state, which also catches a 401.
+
+function retryStream() {
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(async () => {
+    await reload();
+    if (state) connectStream();
+  }, retryDelay);
+  retryDelay = Math.min(retryDelay * 2, 60_000);
+}
+
 function connectStream() {
   if (stream) return;
   stream = new EventSource('/api/stream');
+  stream.onerror = () => {
+    setOffline(true);
+    if (stream?.readyState === EventSource.CLOSED) {
+      stream = null;
+      retryStream();
+    }
+  };
   stream.onmessage = (msg) => {
     const ev = JSON.parse(msg.data);
     const me = state?.me;
     if (me && ev.target_user_id === me.id && ev.type === 'your_turn') {
       notify(`⚡ It's your turn! The charger is held for you until ${fmtTime(ev.data.until)}.`);
+    } else if (me && ev.target_user_id === me.id && ev.type === 'queue_skipped') {
+      notify("⌛ Your hold on the charger expired, so you've been taken out of the queue. Rejoin any time.");
     } else if (me && ev.target_user_id === me.id && ev.type === 'overdue') {
       notify('⏰ Your charge time is up — please move your car or update your finish time.');
     } else if (me && ev.user_id !== me.id && ev.type === 'message') {
@@ -239,8 +336,12 @@ function connectStream() {
     }
     scheduleReload();
   };
-  // EventSource reconnects on its own; resync whenever it does.
-  stream.onopen = scheduleReload;
+  // Resync whenever the stream (re)connects, since events may have been missed.
+  stream.onopen = () => {
+    retryDelay = 2000;
+    setOffline(false);
+    scheduleReload();
+  };
 }
 
 // ---------- rendering ----------
@@ -305,10 +406,14 @@ function renderCharger() {
   const pill = $('#charger-pill');
   pill.className = `pill ${mode}`;
   pill.textContent =
-    mode === 'free' ? '● Charger free' : mode === 'reserved' ? `● Held for ${reservation.name}` : `● ${active.name} charging`;
+    mode === 'free'
+      ? '● Charger free'
+      : mode === 'reserved'
+        ? `● Held for ${reservation.name}`
+        : `● ${active.name} charging`;
 
-  let body = '';
-  let actions = '';
+  let body;
+  let actions;
 
   if (active) {
     const start = Date.parse(active.started_at);
@@ -351,7 +456,7 @@ function renderCharger() {
          <p class="charger-sub">They're next in the queue and have until ${fmtTime(reservation.until)} to plug in. After that, anyone can use it.</p>`;
     body = `<div class="charger-main">${thumbFor(reservation.user_id, 'lg')}<div>${text}</div></div>`;
     actions = mine
-      ? `${durationPicker('start', 'Charging for:')}<button class="ghost small" data-act="leave" type="button">Skip my turn</button>`
+      ? `${durationPicker('start', 'Charging for:')}<button class="ghost small" data-act="leave" data-confirm="Give up your turn? The charger will pass to the next driver and you'll leave the queue." type="button">Skip my turn</button>`
       : queueActions(inQueue);
   } else {
     body = `<p class="charger-big">The charger is free</p>
@@ -362,7 +467,10 @@ function renderCharger() {
   $('#charger-body').innerHTML = body;
   // Don't wipe inputs the user is typing into on periodic re-renders.
   const actionsEl = $('#charger-actions');
-  if (actionsEl.dataset.key !== `${mode}|${active?.user_id}|${reservation?.user_id}|${inQueue}` || !actionsEl.contains(document.activeElement)) {
+  if (
+    actionsEl.dataset.key !== `${mode}|${active?.user_id}|${reservation?.user_id}|${inQueue}` ||
+    !actionsEl.contains(document.activeElement)
+  ) {
     actionsEl.innerHTML = actions;
     actionsEl.dataset.key = `${mode}|${active?.user_id}|${reservation?.user_id}|${inQueue}`;
   }
@@ -372,7 +480,7 @@ function queueActions(inQueue) {
   return inQueue
     ? `<button class="ghost" data-act="leave" type="button">Leave the queue</button>`
     : `<div class="inline-field">
-         <input id="queue-note" maxlength="140" placeholder="Optional note, e.g. 'at 15%, need ~2h'" />
+         <input id="queue-note" maxlength="140" placeholder="Optional note, e.g. 'at 15%, need ~2h'" aria-label="Note for the queue (optional)" />
          <button data-act="join" type="button">Join the queue</button>
        </div>`;
 }
@@ -392,6 +500,9 @@ $('#charger-actions').addEventListener('click', async (e) => {
   if (!btn) return;
   const act = btn.dataset.act;
   $('#charger-error').textContent = '';
+  if (btn.dataset.confirm && !confirm(btn.dataset.confirm)) return;
+  const buttons = $$('#charger-actions button');
+  buttons.forEach((b) => (b.disabled = true));
   try {
     let expected_end;
     if (btn.dataset.hours) expected_end = new Date(Date.now() + Number(btn.dataset.hours) * 3600_000).toISOString();
@@ -409,6 +520,8 @@ $('#charger-actions').addEventListener('click', async (e) => {
     await reload();
   } catch (err) {
     $('#charger-error').textContent = err.message;
+  } finally {
+    buttons.forEach((b) => (b.disabled = false)); // no-op if a re-render replaced them
   }
 });
 
@@ -428,7 +541,7 @@ function renderQueue() {
           ${q.note ? `<div class="note">“${esc(q.note)}”</div>` : ''}
         </div>
         ${reservation?.user_id === q.user_id ? '<span class="badge reserved">Up now</span>' : ''}
-      </li>`
+      </li>`,
         )
         .join('')
     : '<li class="empty">Nobody waiting.</li>';
@@ -514,7 +627,8 @@ function renderMyCar() {
 }
 
 $('#color-swatches').innerHTML = CAR_COLORS.map(
-  (c) => `<button type="button" class="swatch" role="radio" data-color="${c.hex}" style="background:${c.hex}" title="${c.name}" aria-label="${c.name}"></button>`
+  (c) =>
+    `<button type="button" class="swatch" role="radio" data-color="${c.hex}" style="background:${c.hex}" title="${c.name}" aria-label="${c.name}"></button>`,
 ).join('');
 
 $('#color-swatches').addEventListener('click', (e) => {
@@ -567,7 +681,7 @@ $('#status-form').addEventListener('submit', async (e) => {
     const body = Object.fromEntries(new FormData(e.target));
     body.daily_miles = inputToMiles(body.daily_miles);
     body.full_range_mi = inputToMiles(body.full_range_mi);
-    await api('/api/me', { method: 'PUT', body });
+    await whileBusy([e.target.querySelector('[type="submit"]')], () => api('/api/me', { method: 'PUT', body }));
     statusDirty = false;
     msg.textContent = 'Saved.';
     setTimeout(() => (msg.textContent = ''), 2500);
@@ -577,10 +691,25 @@ $('#status-form').addEventListener('submit', async (e) => {
   }
 });
 
+$('#delete-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  $('#delete-error').textContent = '';
+  if (!confirm('Delete your account and all your data for good?')) return;
+  try {
+    await api('/api/me', { method: 'DELETE', body: { password: e.target.password.value } });
+    e.target.reset();
+    showAuth();
+  } catch (err) {
+    $('#delete-error').textContent = err.message;
+  }
+});
+
 $('#broadcast-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   try {
-    await api('/api/broadcast', { method: 'POST', body: { message: e.target.message.value } });
+    await whileBusy([e.target.querySelector('button')], () =>
+      api('/api/broadcast', { method: 'POST', body: { message: e.target.message.value } }),
+    );
     e.target.reset();
   } catch (err) {
     toast(err.message);
@@ -592,18 +721,32 @@ function eventText(ev) {
   const t = ev.target_user_id ? nameLink(ev.target_user_id, ev.target) : '<strong>Someone</strong>';
   const d = ev.data || {};
   switch (ev.type) {
-    case 'registered': return `👋 ${a} joined the community (${esc(d.car_model)})`;
-    case 'status': return `🔋 ${a} is at ${d.charge_level}%, driving ${showDist(d.daily_miles)} ${distUnit()}/day`;
-    case 'start': return `⚡ ${a} plugged in — expects to be done at <strong>${fmtTime(d.expected_end)}</strong>`;
-    case 'extend': return `🕒 ${a} now expects to be done at <strong>${fmtTime(d.expected_end)}</strong>`;
-    case 'end': return `✅ ${a} unplugged after ${fmtDuration(d.minutes)}${d.end_level != null ? ` at ${d.end_level}%` : ''} — charger is free`;
-    case 'queue_join': return `🙋 ${a} joined the queue${d.note ? `: “${esc(d.note)}”` : ''}`;
-    case 'queue_leave': return `${a} left the queue`;
-    case 'your_turn': return `➡️ Charger passed to ${t} — held until ${fmtTime(d.until)}`;
-    case 'overdue': return `<span class="alert">⏰ ${t}'s charge was due at ${fmtTime(d.expected_end)}</span>`;
-    case 'photo': return `📷 ${a} added a photo of their ${esc(d.car_model)}`;
-    case 'message': return `💬 ${a}<br><span class="msg">${esc(d.message)}</span>`;
-    default: return esc(ev.type);
+    case 'registered':
+      return `👋 ${a} joined the community (${esc(d.car_model)})`;
+    case 'status':
+      return `🔋 ${a} is at ${d.charge_level}%, driving ${showDist(d.daily_miles)} ${distUnit()}/day`;
+    case 'start':
+      return `⚡ ${a} plugged in — expects to be done at <strong>${fmtTime(d.expected_end)}</strong>`;
+    case 'extend':
+      return `🕒 ${a} now expects to be done at <strong>${fmtTime(d.expected_end)}</strong>`;
+    case 'end':
+      return `✅ ${a} unplugged after ${fmtDuration(d.minutes)}${d.end_level != null ? ` at ${d.end_level}%` : ''} — charger is free`;
+    case 'queue_join':
+      return `🙋 ${a} joined the queue${d.note ? `: “${esc(d.note)}”` : ''}`;
+    case 'queue_leave':
+      return `${a} left the queue`;
+    case 'your_turn':
+      return `➡️ Charger passed to ${t} — held until ${fmtTime(d.until)}`;
+    case 'queue_skipped':
+      return `⌛ ${t}'s hold expired — removed from the queue`;
+    case 'overdue':
+      return `<span class="alert">⏰ ${t}'s charge was due at ${fmtTime(d.expected_end)}</span>`;
+    case 'photo':
+      return `📷 ${a} added a photo of their ${esc(d.car_model)}`;
+    case 'message':
+      return `💬 ${a}<br><span class="msg">${esc(d.message)}</span>`;
+    default:
+      return esc(ev.type);
   }
 }
 
@@ -622,7 +765,7 @@ function showView(name) {
   $('#view-community').hidden = name !== 'community';
   $('#view-usage').hidden = name !== 'usage';
   $('#view-profile').hidden = name !== 'profile';
-  $$('[data-view]').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
+  $$('[data-view]').forEach((b) => selectTab(b, b.dataset.view === name));
   if (name === 'usage') loadUsage();
 }
 
@@ -643,9 +786,10 @@ window.addEventListener('hashchange', () => state && route());
 $$('[data-view]').forEach((btn) =>
   btn.addEventListener('click', () => {
     lastTab = btn.dataset.view;
-    if (location.hash) location.hash = ''; // leaving a profile; route() shows the tab
+    if (location.hash)
+      location.hash = ''; // leaving a profile; route() shows the tab
     else showView(lastTab);
-  })
+  }),
 );
 
 $('.back-link').addEventListener('click', (e) => {
@@ -655,8 +799,6 @@ $('.back-link').addEventListener('click', (e) => {
 
 // ---------- driver profile ----------
 
-let profileId = null;
-
 async function loadProfile(id) {
   const first = profileId !== id;
   profileId = id;
@@ -665,7 +807,8 @@ async function loadProfile(id) {
     const profile = await api(`/api/users/${id}/profile`);
     if (profileId === id) renderProfile(profile);
   } catch (err) {
-    if (profileId === id) $('#profile').innerHTML = `<article class="card"><p class="error">${esc(err.message)}</p></article>`;
+    if (profileId === id)
+      $('#profile').innerHTML = `<article class="card"><p class="error">${esc(err.message)}</p></article>`;
   }
 }
 
@@ -693,12 +836,16 @@ function sessionRow(s) {
   const time = `${shortTime(s.started_at)} – ${s.ended_at ? shortTime(s.ended_at) : 'now'}`;
   const charge = s.start_level != null ? `${s.start_level}% → ${s.end_level != null ? s.end_level + '%' : '…'}` : '—';
   const done =
-    s.on_time === null ? 'In progress' : s.on_time ? '<span class="ok">✓ On time</span>' : '<span class="late-text">Overstayed</span>';
+    s.on_time === null
+      ? 'In progress'
+      : s.on_time
+        ? '<span class="ok">✓ On time</span>'
+        : '<span class="late-text">Overstayed</span>';
   return `<tr><td>${date}</td><td>${time}</td><td class="num">${fmtDuration((end - Date.parse(s.started_at)) / 60000)}</td>
     <td>${charge}</td><td>${done}</td></tr>`;
 }
 
-function renderProfile({ driver: d, status, stats, sessions, events }) {
+function renderProfile({ driver: d, status, stats, sessions, events, named_history_days }) {
   const isMe = d.id === state.me.id;
   const lvl = d.charge_level;
   const fill = lvl < 25 ? 'low' : lvl < 50 ? 'mid' : '';
@@ -749,24 +896,20 @@ function renderProfile({ driver: d, status, stats, sessions, events }) {
       ${tile('All-time sessions', stats.sessions)}
     </div>
     <div class="grid profile-grid">
-      <article class="card"><h3>Recent charging</h3>${history}</article>
+      <article class="card"><h3>Recent charging</h3>${history}
+        ${isMe ? '' : `<p class="muted small-text">Only sessions from the last ${named_history_days} days are listed.</p>`}</article>
       <article class="card"><h3>Recent activity</h3><ul class="feed">${activity}</ul></article>
     </div>`;
 }
 
-$$('[data-days]').forEach((btn) =>
-  btn.addEventListener('click', () => {
-    $$('[data-days]').forEach((b) => b.classList.toggle('active', b === btn));
-    usageDays = Number(btn.dataset.days);
-    loadUsage();
-  })
-);
+$$('[data-days]').forEach((btn) => btn.addEventListener('click', () => loadUsage(Number(btn.dataset.days))));
 
 // ---------- usage analytics ----------
 
 const OFFICE_START = 8;
 const OFFICE_END = 18;
-const isOfficeHour = (d) => d.getDay() >= 1 && d.getDay() <= 5 && d.getHours() >= OFFICE_START && d.getHours() < OFFICE_END;
+const isOfficeHour = (d) =>
+  d.getDay() >= 1 && d.getDay() <= 5 && d.getHours() >= OFFICE_START && d.getHours() < OFFICE_END;
 const dayKey = (d) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 
 function nextHour(t) {
@@ -775,8 +918,28 @@ function nextHour(t) {
   return d.getTime();
 }
 
-async function loadUsage() {
-  const { sessions } = await api(`/api/sessions?days=${usageDays}`);
+/** Fetch and show usage for a range. The range buttons only switch once it has loaded. */
+async function loadUsage(days = usageDays) {
+  const view = $('#view-usage');
+  const request = (loadUsage.last = {});
+  view.setAttribute('aria-busy', 'true');
+  $('#usage-error').textContent = '';
+  let data;
+  try {
+    data = await api(`/api/sessions?days=${days}`);
+  } catch (err) {
+    if (loadUsage.last === request) $('#usage-error').textContent = `Couldn't load usage: ${err.message}`;
+    return;
+  } finally {
+    if (loadUsage.last === request) view.removeAttribute('aria-busy');
+  }
+  if (loadUsage.last !== request) return; // a newer request superseded this one
+  usageDays = days;
+  $$('[data-days]').forEach((b) => setPressed(b, Number(b.dataset.days) === days));
+  renderUsage(data);
+}
+
+function renderUsage({ sessions, drivers }) {
   const now = Date.now();
   const rangeStart = new Date(now);
   rangeStart.setHours(0, 0, 0, 0);
@@ -789,7 +952,6 @@ async function loadUsage() {
   }
   const dayIdx = Object.fromEntries(days.map((d, i) => [d.key, i]));
   const hours = Array.from({ length: 24 }, (_, h) => ({ h, ms: 0 }));
-  const perDriver = new Map();
   let totalMs = 0;
   let officeBusyMs = 0;
   let overstays = 0;
@@ -799,7 +961,7 @@ async function loadUsage() {
     const start = Math.max(Date.parse(s.started_at), from);
     const end = s.ended_at ? Date.parse(s.ended_at) : now;
     if (end <= start) continue;
-    for (let t = start; t < end; ) {
+    for (let t = start; t < end;) {
       const next = Math.min(end, nextHour(t));
       const d = new Date(t);
       const slice = next - t;
@@ -811,18 +973,11 @@ async function loadUsage() {
     }
     const ms = end - start;
     totalMs += ms;
-    const late = s.ended_at && Date.parse(s.ended_at) > Date.parse(s.expected_end) + 10 * 60_000;
-    if (late) overstays++;
-    const p = perDriver.get(s.user_id) || { name: s.name, count: 0, ms: 0, late: 0, last: s.started_at };
-    p.count++;
-    p.ms += ms;
-    if (late) p.late++;
-    if (s.started_at > p.last) p.last = s.started_at;
-    perDriver.set(s.user_id, p);
+    if (s.ended_at && Date.parse(s.ended_at) > Date.parse(s.expected_end) + 10 * 60_000) overstays++;
   }
 
   let officeAvailMs = 0;
-  for (let t = from; t < now; ) {
+  for (let t = from; t < now;) {
     const next = Math.min(now, nextHour(t));
     if (isOfficeHour(new Date(t))) officeAvailMs += next - t;
     t = next;
@@ -847,24 +1002,25 @@ async function loadUsage() {
       value: hrs(d.ms),
       label: i % labelEvery === 0 ? d.date.toLocaleDateString([], { month: 'short', day: 'numeric' }) : '',
       tip: `${d.date.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}: ${hrs(d.ms).toFixed(1)} h`,
-    }))
+    })),
   );
   barChart(
     $('#chart-hourly'),
     hours.map(({ h, ms }) => {
       const label = new Date(2000, 0, 1, h).toLocaleTimeString([], { hour: 'numeric' });
       return { value: hrs(ms), label: h % 3 === 0 ? label : '', tip: `${label}: ${hrs(ms).toFixed(1)} h in use` };
-    })
+    }),
   );
 
-  const rows = [...perDriver.values()].sort((a, b) => b.ms - a.ms);
+  // Per-driver totals come from the server, since older sessions arrive without names.
+  const rows = drivers.sort((a, b) => b.ms - a.ms);
   $('#driver-table').innerHTML = rows.length
     ? `<thead><tr><th>Driver</th><th class="num">Sessions</th><th class="num">Hours</th><th class="num">Avg session</th>
          <th>Share of use</th><th class="num">Overstays</th><th>Last charged</th></tr></thead>
        <tbody>${rows
          .map((r) => {
            const share = totalMs ? (r.ms / totalMs) * 100 : 0;
-           return `<tr><td>${esc(r.name)}</td><td class="num">${r.count}</td><td class="num">${hrs(r.ms).toFixed(1)}</td>
+           return `<tr><td>${nameLink(r.user_id, r.name)}</td><td class="num">${r.count}</td><td class="num">${hrs(r.ms).toFixed(1)}</td>
              <td class="num">${fmtDuration(r.ms / r.count / 60000)}</td>
              <td>${Math.round(share)}%<span class="share" style="width:${share * 0.8}px"></span></td>
              <td class="num">${r.late}</td><td>${fmtTime(r.last)}</td></tr>`;
@@ -878,25 +1034,59 @@ function barChart(el, data) {
   el.innerHTML = `
     <div class="bars-max">max ${max < 0.01 ? 0 : max.toFixed(1)} h</div>
     <div class="bars-plot">${data
-      .map((d) => `<div class="bar-slot" data-tip="${esc(d.tip)}"><div class="bar" style="height:${(d.value / max) * 100}%"></div></div>`)
+      .map(
+        (
+          d,
+          i,
+        ) => `<div class="bar-slot" data-tip="${esc(d.tip)}" role="img" aria-label="${esc(d.tip)}" tabindex="${i === 0 ? 0 : -1}">
+          <div class="bar" style="height:${(d.value / max) * 100}%"></div></div>`,
+      )
       .join('')}</div>
     <div class="bars-axis">${data.map((d) => `<span>${esc(d.label)}</span>`).join('')}</div>`;
 }
 
-// Shared hover tooltip for chart bars.
-document.addEventListener('mousemove', (e) => {
+// Shared tooltip for chart bars: follows the mouse, or sits above a bar that
+// was tapped or reached with the keyboard.
+function showTip(slot, x, y) {
   const tip = $('#tooltip');
-  const slot = e.target.closest?.('[data-tip]');
   if (!slot) return (tip.hidden = true);
   tip.textContent = slot.dataset.tip;
   tip.hidden = false;
-  const x = Math.min(e.clientX + 12, window.innerWidth - tip.offsetWidth - 8);
-  tip.style.left = `${x}px`;
-  tip.style.top = `${e.clientY - 34}px`;
+  tip.style.left = `${Math.max(8, Math.min(x + 12, window.innerWidth - tip.offsetWidth - 8))}px`;
+  tip.style.top = `${y - 34}px`;
+}
+const showTipAbove = (slot) => {
+  const r = slot.getBoundingClientRect();
+  showTip(slot, r.left + r.width / 2 - 12, r.top);
+};
+document.addEventListener('mousemove', (e) => {
+  const slot = e.target.closest?.('[data-tip]');
+  const keyboardTip = document.activeElement?.dataset?.tip !== undefined;
+  if (slot || !keyboardTip) showTip(slot, e.clientX, e.clientY); // don't hide a focused bar's tip
+});
+document.addEventListener('click', (e) => {
+  const slot = e.target.closest?.('[data-tip]');
+  if (slot) showTipAbove(slot);
+});
+document.addEventListener('focusin', (e) => (e.target.dataset?.tip ? showTipAbove(e.target) : showTip(null)));
+document.addEventListener('focusout', () => showTip(null));
+// Arrow keys step through a chart's bars; only one bar is a tab stop.
+document.addEventListener('keydown', (e) => {
+  const slot = e.target.closest?.('.bar-slot');
+  if (!slot) return;
+  const slots = [...slot.parentElement.children];
+  const i = slots.indexOf(slot);
+  const next = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: slots.length - 1 }[e.key];
+  if (next === undefined || !slots[next]) return;
+  e.preventDefault();
+  slot.tabIndex = -1;
+  slots[next].tabIndex = 0;
+  slots[next].focus();
 });
 
-// Keep countdowns and "x minutes ago" fresh.
-setInterval(() => state && render(), 30_000);
+// Re-fetch now and then too, in case an update was missed; this also keeps
+// countdowns and "x minutes ago" fresh.
+setInterval(() => state && reload(), 30_000);
 
 convertDistInputs($('#register-form'), 'imperial', units); // defaults in the HTML are miles
 applyUnits();
