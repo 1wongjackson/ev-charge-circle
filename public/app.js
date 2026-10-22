@@ -103,6 +103,12 @@ function ago(iso) {
   return `${Math.round(min / 1440)}d ago`;
 }
 
+/** Whether a charging session is still on time or past its promised end. */
+const sessionMode = (s) => (Date.parse(s.expected_end) < Date.now() ? 'late' : 'busy');
+
+/** " at Charger 2", or nothing when there's only one charger. */
+const atCharger = (no) => (no && state?.charger.chargers.length > 1 ? ` at Charger ${no}` : '');
+
 /** Mark a toggle button as on/off, for both the styling and screen readers. */
 function setPressed(btn, on) {
   btn.classList.toggle('active', on);
@@ -324,15 +330,23 @@ function connectStream() {
     const ev = JSON.parse(msg.data);
     const me = state?.me;
     if (me && ev.target_user_id === me.id && ev.type === 'your_turn') {
-      notify(`⚡ It's your turn! The charger is held for you until ${fmtTime(ev.data.until)}.`);
+      notify(`⚡ It's your turn! A charger is held for you until ${fmtTime(ev.data.until)}.`);
     } else if (me && ev.target_user_id === me.id && ev.type === 'queue_skipped') {
       notify("⌛ Your hold on the charger expired, so you've been taken out of the queue. Rejoin any time.");
     } else if (me && ev.target_user_id === me.id && ev.type === 'overdue') {
-      notify('⏰ Your charge time is up — please move your car or update your finish time.');
+      notify(
+        `⏰ Your charge time is up — please move your car or update your finish time.${
+          state.auto_release_minutes
+            ? ` You'll be released from the charger in ${state.auto_release_minutes} minutes.`
+            : ''
+        }`,
+      );
+    } else if (me && ev.target_user_id === me.id && ev.type === 'auto_end') {
+      notify("⏏️ Your charging time ran out, so you've been released from the charger. Please move your car.");
     } else if (me && ev.user_id !== me.id && ev.type === 'message') {
       toast(`${ev.actor}: ${ev.data.message}`);
     } else if (me && ev.user_id !== me.id && ev.type === 'start') {
-      toast(`${ev.actor} plugged in · done ~${fmtTime(ev.data.expected_end)}`);
+      toast(`${ev.actor} plugged in${atCharger(ev.data.charger)} · done ~${fmtTime(ev.data.expected_end)}`);
     }
     scheduleReload();
   };
@@ -354,13 +368,17 @@ function render() {
   renderDrivers();
   renderStatusForm();
   renderFeed();
+  renderAdmin();
 }
 
+// Overall status of the chargers: free (one is open to anyone), reserved (the
+// free ones are held for the queue), busy, or late (all in use, one overdue).
 function chargerMode() {
-  const { active, reservation } = state.charger;
-  if (active) return Date.parse(active.expected_end) < Date.now() ? 'late' : 'busy';
-  if (reservation) return 'reserved';
-  return 'free';
+  const { chargers, reservations } = state.charger;
+  const free = chargers.filter((c) => !c.session).length;
+  if (free > reservations.length) return 'free';
+  if (free) return 'reserved';
+  return chargers.some((c) => sessionMode(c.session) === 'late') ? 'late' : 'busy';
 }
 
 function durationPicker(action, label) {
@@ -395,85 +413,135 @@ function profileLink(d, html) {
 const nameLink = (id, name) => `<a class="name-link" href="${profileHref(id)}"><strong>${esc(name)}</strong></a>`;
 
 function renderCharger() {
-  const { active, reservation, queue } = state.charger;
+  const { chargers, reservations, queue, site_name } = state.charger;
   const me = state.me;
+  const many = chargers.length > 1;
   const mode = chargerMode();
+  const free = chargers.filter((c) => !c.session);
+  const openToAll = free.length - reservations.length;
+  const mine = chargers.find((c) => c.session?.user_id === me.id);
+  const myHold = reservations.find((r) => r.user_id === me.id);
   const inQueue = queue.some((q) => q.user_id === me.id);
-  const statusText = { free: 'Available', busy: 'In use', late: 'Overdue', reserved: 'Reserved' }[mode];
 
+  $('#charger-title').textContent = `${site_name} charger${many ? 's' : ''}`;
+  document.title = `${site_name} · EV Charge Circle`;
+  const statusText = many
+    ? { free: `${openToAll} of ${chargers.length} free`, busy: 'All in use', late: 'All in use', reserved: 'Reserved' }
+    : { free: 'Available', busy: 'In use', late: 'Overdue', reserved: 'Reserved' };
   $('#charger-status').className = `badge ${mode}`;
-  $('#charger-status').textContent = statusText;
+  $('#charger-status').textContent = statusText[mode];
   const pill = $('#charger-pill');
   pill.className = `pill ${mode}`;
-  pill.textContent =
-    mode === 'free'
-      ? '● Charger free'
-      : mode === 'reserved'
-        ? `● Held for ${reservation.name}`
-        : `● ${active.name} charging`;
+  pill.textContent = many
+    ? {
+        free: `● ${openToAll} of ${chargers.length} chargers free`,
+        reserved: '● Chargers held for the queue',
+        busy: `● All ${chargers.length} chargers in use`,
+        late: `● All ${chargers.length} chargers in use`,
+      }[mode]
+    : {
+        free: '● Charger free',
+        reserved: `● Held for ${reservations[0]?.name}`,
+        busy: `● ${chargers[0].session?.name} charging`,
+        late: `● ${chargers[0].session?.name} charging`,
+      }[mode];
 
-  let body;
+  // Holds aren't tied to a charger; show them against the free ones in order.
+  const holds = new Map(free.map((c, i) => [c.no, reservations[i]]));
+  $('#charger-body').innerHTML = `<div class="${many ? 'charger-slots' : ''}">${chargers
+    .map((c) => chargerSlot(c, holds.get(c.no), many))
+    .join('')}</div>`;
+
   let actions;
+  const picker = chargerPicker(free, many);
+  if (mine) {
+    actions = `
+      <div class="stack">
+        <div class="inline-field">
+          <label class="muted small-text" for="end-level">Charge when unplugging (%)</label>
+          <input id="end-level" type="number" min="0" max="100" placeholder="e.g. 80" />
+          <button data-act="end" type="button">I'm done — release charger${many ? ` ${mine.no}` : ''}</button>
+        </div>
+        ${durationPicker('update', 'Change finish time:')}
+      </div>`;
+  } else if (myHold) {
+    actions = `
+      <div class="stack">
+        <div>
+          <p class="charger-big">⚡ It's your turn!</p>
+          <p class="charger-sub">${many ? 'A charger is' : 'The charger is'} held for you until <strong>${fmtTime(myHold.until)}</strong>. Plug in and let everyone know how long you'll be.</p>
+        </div>
+        ${picker}${durationPicker('start', 'Charging for:')}
+        <div><button class="ghost small" data-act="leave" data-confirm="Give up your turn? The charger will pass to the next driver and you'll leave the queue." type="button">Skip my turn</button></div>
+      </div>`;
+  } else if (openToAll > 0) {
+    actions = `<div class="stack">${picker}${durationPicker('start', 'Charging for:')}
+      ${inQueue ? '<div><button class="ghost small" data-act="leave" type="button">Leave the queue</button></div>' : ''}</div>`;
+  } else {
+    actions = queueActions(inQueue);
+  }
 
-  if (active) {
-    const start = Date.parse(active.started_at);
-    const end = Date.parse(active.expected_end);
+  // Don't wipe inputs the user is typing into on periodic re-renders.
+  const actionsEl = $('#charger-actions');
+  const key = `${mode}|${mine?.no}|${Boolean(myHold)}|${inQueue}|${free.map((c) => c.no)}`;
+  if (actionsEl.dataset.key !== key || !actionsEl.contains(document.activeElement)) {
+    actionsEl.innerHTML = actions;
+    actionsEl.dataset.key = key;
+  }
+}
+
+/** One charger: who's on it, who it's held for, or that it's free. */
+function chargerSlot(c, hold, many) {
+  const me = state.me;
+  const s = c.session;
+  const mode = s ? sessionMode(s) : hold ? 'reserved' : 'free';
+  const head = many
+    ? `<div class="slot-head"><strong>Charger ${c.no}</strong>
+        <span class="badge ${mode}">${{ free: 'Free', reserved: 'Held', busy: 'In use', late: 'Overdue' }[mode]}</span></div>`
+    : '';
+  const size = many ? '' : 'lg';
+  let body;
+  if (s) {
+    const start = Date.parse(s.started_at);
+    const end = Date.parse(s.expected_end);
     const pct = Math.min(100, Math.max(0, ((Date.now() - start) / (end - start)) * 100));
     const remaining = (end - Date.now()) / 60000;
-    const mine = active.user_id === me.id;
+    const waiting = state.charger.queue.length;
     body = `
       <div class="charger-main">
-        ${thumbFor(active.user_id, 'lg')}
+        ${thumbFor(s.user_id, size)}
         <div>
-          <p class="charger-big">${mine ? "You're charging" : `${esc(active.name)} is charging`}</p>
-          <p class="charger-sub">${esc(active.car_model)} · plugged in at ${fmtTime(active.started_at)}
-            ${active.start_level != null ? ` at ${active.start_level}%` : ''}</p>
+          <p class="charger-big">${s.user_id === me.id ? "You're charging" : `${esc(s.name)} is charging`}</p>
+          <p class="charger-sub">${esc(s.car_model)} · plugged in at ${fmtTime(s.started_at)}
+            ${s.start_level != null ? ` at ${s.start_level}%` : ''}</p>
         </div>
       </div>
       <div class="progress ${mode === 'late' ? 'late' : ''}"><span style="width:${pct}%"></span></div>
-      <p class="charger-sub"><strong>Expected done ${fmtTime(active.expected_end)}</strong>
+      <p class="charger-sub"><strong>Expected done ${fmtTime(s.expected_end)}</strong>
         · ${remaining >= 0 ? `${fmtDuration(remaining)} left` : `${fmtDuration(-remaining)} over`}
-        ${queue.length ? ` · ${queue.length} waiting` : ''}</p>`;
-    if (mine) {
-      actions = `
-        <div class="stack">
-          <div class="inline-field">
-            <label class="muted small-text" for="end-level">Charge when unplugging (%)</label>
-            <input id="end-level" type="number" min="0" max="100" placeholder="e.g. 80" />
-            <button data-act="end" type="button">I'm done — release charger</button>
-          </div>
-          ${durationPicker('update', 'Change finish time:')}
-        </div>`;
-    } else {
-      actions = queueActions(inQueue);
-    }
-  } else if (reservation) {
-    const mine = reservation.user_id === me.id;
-    const text = mine
-      ? `<p class="charger-big">⚡ It's your turn!</p>
-         <p class="charger-sub">The charger is held for you until <strong>${fmtTime(reservation.until)}</strong>. Plug in and let everyone know how long you'll be.</p>`
-      : `<p class="charger-big">Held for ${esc(reservation.name)}</p>
-         <p class="charger-sub">They're next in the queue and have until ${fmtTime(reservation.until)} to plug in. After that, anyone can use it.</p>`;
-    body = `<div class="charger-main">${thumbFor(reservation.user_id, 'lg')}<div>${text}</div></div>`;
-    actions = mine
-      ? `${durationPicker('start', 'Charging for:')}<button class="ghost small" data-act="leave" data-confirm="Give up your turn? The charger will pass to the next driver and you'll leave the queue." type="button">Skip my turn</button>`
-      : queueActions(inQueue);
+        ${!many && waiting ? ` · ${waiting} waiting` : ''}</p>`;
+  } else if (hold) {
+    const mineHold = hold.user_id === me.id;
+    body = `<div class="charger-main">${thumbFor(hold.user_id, size)}<div>
+        <p class="charger-big">${mineHold ? 'Held for you' : `Held for ${esc(hold.name)}`}</p>
+        <p class="charger-sub">${mineHold ? 'You have' : "They're next in the queue and have"} until ${fmtTime(hold.until)} to plug in.${mineHold ? '' : ' After that, it passes to the next driver.'}</p>
+      </div></div>`;
   } else {
-    body = `<p class="charger-big">The charger is free</p>
-            <p class="charger-sub">Plug in and broadcast when you expect to be done so the next driver can plan.</p>`;
-    actions = durationPicker('start', 'Charging for:');
+    body = many
+      ? '<p class="charger-sub">Free to use.</p>'
+      : `<p class="charger-big">The charger is free</p>
+         <p class="charger-sub">Plug in and broadcast when you expect to be done so the next driver can plan.</p>`;
   }
+  return `<div class="${many ? 'charger-slot' : ''}">${head}${body}</div>`;
+}
 
-  $('#charger-body').innerHTML = body;
-  // Don't wipe inputs the user is typing into on periodic re-renders.
-  const actionsEl = $('#charger-actions');
-  if (
-    actionsEl.dataset.key !== `${mode}|${active?.user_id}|${reservation?.user_id}|${inQueue}` ||
-    !actionsEl.contains(document.activeElement)
-  ) {
-    actionsEl.innerHTML = actions;
-    actionsEl.dataset.key = `${mode}|${active?.user_id}|${reservation?.user_id}|${inQueue}`;
-  }
+/** Which charger you're plugging into, when there's more than one free. */
+function chargerPicker(free, many) {
+  if (!many || free.length < 2) return '';
+  return `<div class="inline-field">
+      <label class="muted small-text" for="start-charger">Plugging into</label>
+      <select id="start-charger">${free.map((c) => `<option value="${c.no}">Charger ${c.no}</option>`).join('')}</select>
+    </div>`;
 }
 
 function queueActions(inQueue) {
@@ -510,7 +578,9 @@ $('#charger-actions').addEventListener('click', async (e) => {
       expected_end = timeInputToIso(btn.dataset.time);
       if (!expected_end) throw new Error('Pick a time first');
     }
-    if (act === 'start') await api('/api/charger/start', { method: 'POST', body: { expected_end } });
+    if (act === 'start') {
+      await api('/api/charger/start', { method: 'POST', body: { expected_end, charger: $('#start-charger')?.value } });
+    }
     if (act === 'update') await api('/api/charger/update', { method: 'POST', body: { expected_end } });
     if (act === 'end') await api('/api/charger/end', { method: 'POST', body: { end_level: $('#end-level').value } });
     if (act === 'join') await api('/api/queue/join', { method: 'POST', body: { note: $('#queue-note').value } });
@@ -526,7 +596,7 @@ $('#charger-actions').addEventListener('click', async (e) => {
 });
 
 function renderQueue() {
-  const { queue, reservation } = state.charger;
+  const { queue } = state.charger;
   $('#queue-count').textContent = queue.length ? `· ${queue.length} waiting` : '';
   $('#queue-list').innerHTML = queue.length
     ? queue
@@ -540,7 +610,7 @@ function renderQueue() {
           <span class="muted small-text"> · ${q.charge_level}% · joined ${fmtTime(q.joined_at)}</span>
           ${q.note ? `<div class="note">“${esc(q.note)}”</div>` : ''}
         </div>
-        ${reservation?.user_id === q.user_id ? '<span class="badge reserved">Up now</span>' : ''}
+        ${q.reserved_until ? '<span class="badge reserved">Up now</span>' : ''}
       </li>`,
         )
         .join('')
@@ -548,19 +618,19 @@ function renderQueue() {
 }
 
 function renderDrivers() {
-  const { active, queue } = state.charger;
+  const { chargers, queue } = state.charger;
+  const charging = new Map(chargers.filter((c) => c.session).map((c) => [c.session.user_id, c.no]));
   const drivers = [...state.drivers].sort((a, b) => (a.days_of_range ?? 1e9) - (b.days_of_range ?? 1e9));
   $('#drivers').innerHTML = drivers
     .map((d) => {
       const lvl = d.charge_level;
       const cls = lvl < 25 ? 'low' : lvl < 50 ? 'mid' : '';
       const qPos = queue.findIndex((q) => q.user_id === d.id);
-      const badge =
-        active?.user_id === d.id
-          ? '<span class="badge busy">⚡ Charging</span>'
-          : qPos >= 0
-            ? `<span class="badge">Queue #${qPos + 1}</span>`
-            : '';
+      const badge = charging.has(d.id)
+        ? `<span class="badge busy">⚡ Charging${chargers.length > 1 ? ` · #${charging.get(d.id)}` : ''}</span>`
+        : qPos >= 0
+          ? `<span class="badge">Queue #${qPos + 1}</span>`
+          : '';
       return `
       <div class="driver ${d.id === state.me.id ? 'me' : ''}">
         <div class="driver-head">
@@ -726,21 +796,25 @@ function eventText(ev) {
     case 'status':
       return `🔋 ${a} is at ${d.charge_level}%, driving ${showDist(d.daily_miles)} ${distUnit()}/day`;
     case 'start':
-      return `⚡ ${a} plugged in — expects to be done at <strong>${fmtTime(d.expected_end)}</strong>`;
+      return `⚡ ${a} plugged in${atCharger(d.charger)} — expects to be done at <strong>${fmtTime(d.expected_end)}</strong>`;
     case 'extend':
       return `🕒 ${a} now expects to be done at <strong>${fmtTime(d.expected_end)}</strong>`;
     case 'end':
-      return `✅ ${a} unplugged after ${fmtDuration(d.minutes)}${d.end_level != null ? ` at ${d.end_level}%` : ''} — charger is free`;
+      return `✅ ${a} unplugged after ${fmtDuration(d.minutes)}${d.end_level != null ? ` at ${d.end_level}%` : ''} — ${d.charger && state.charger.chargers.length > 1 ? `Charger ${d.charger}` : 'charger'} is free`;
+    case 'auto_end':
+      return `⏏️ ${t}'s charging time ran out — released${atCharger(d.charger) ? ` from Charger ${d.charger}` : ' from the charger'} after ${fmtDuration(d.minutes)}`;
+    case 'site':
+      return `🛠️ ${a} set up the site: <strong>${esc(d.name)}</strong> with ${d.chargers} charger${d.chargers === 1 ? '' : 's'}`;
     case 'queue_join':
       return `🙋 ${a} joined the queue${d.note ? `: “${esc(d.note)}”` : ''}`;
     case 'queue_leave':
       return `${a} left the queue`;
     case 'your_turn':
-      return `➡️ Charger passed to ${t} — held until ${fmtTime(d.until)}`;
+      return `➡️ A charger is free for ${t} — held until ${fmtTime(d.until)}`;
     case 'queue_skipped':
       return `⌛ ${t}'s hold expired — removed from the queue`;
     case 'overdue':
-      return `<span class="alert">⏰ ${t}'s charge was due at ${fmtTime(d.expected_end)}</span>`;
+      return `<span class="alert">⏰ ${t}'s charge${atCharger(d.charger)} was due at ${fmtTime(d.expected_end)}</span>`;
     case 'photo':
       return `📷 ${a} added a photo of their ${esc(d.car_model)}`;
     case 'message':
@@ -755,6 +829,36 @@ function renderFeed() {
     ? state.events.map((ev) => `<li>${eventText(ev)}<time>${ago(ev.created_at)}</time></li>`).join('')
     : '<li class="empty">No activity yet.</li>';
 }
+
+// ---------- admin: site settings ----------
+
+let siteDirty = false;
+
+function renderAdmin() {
+  $('#admin-card').hidden = !state.me.is_admin;
+  if (!state.me.is_admin || siteDirty) return;
+  const f = $('#site-form');
+  f.site_name.value = state.charger.site_name;
+  f.charger_count.value = state.charger.chargers.length;
+}
+
+$('#site-form').addEventListener('input', () => (siteDirty = true));
+
+$('#site-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = $('#site-msg');
+  try {
+    const body = Object.fromEntries(new FormData(e.target));
+    await whileBusy([e.target.querySelector('[type="submit"]')], () => api('/api/admin/site', { method: 'PUT', body }));
+    siteDirty = false;
+    msg.textContent = 'Saved.';
+    setTimeout(() => (msg.textContent = ''), 2500);
+    $('#charger-actions').dataset.key = '';
+    await reload();
+  } catch (err) {
+    msg.textContent = err.message;
+  }
+});
 
 // ---------- tabs ----------
 
@@ -815,11 +919,11 @@ async function loadProfile(id) {
 function profileStatus(status) {
   switch (status.state) {
     case 'charging':
-      return `<span class="badge busy">⚡ Charging now</span>
+      return `<span class="badge busy">⚡ Charging now${atCharger(status.charger)}</span>
         <span class="muted small-text">since ${fmtTime(status.started_at)} · expects to be done ${fmtTime(status.expected_end)}</span>`;
     case 'reserved':
       return `<span class="badge reserved">Up next</span>
-        <span class="muted small-text">the charger is held for them until ${fmtTime(status.until)}</span>`;
+        <span class="muted small-text">a charger is held for them until ${fmtTime(status.until)}</span>`;
     case 'queued':
       return `<span class="badge">#${status.position} in the queue</span>
         <span class="muted small-text">joined ${fmtTime(status.joined_at)}${status.note ? ` · “${esc(status.note)}”` : ''}</span>`;
@@ -979,7 +1083,7 @@ function renderUsage({ sessions, drivers }) {
   let officeAvailMs = 0;
   for (let t = from; t < now;) {
     const next = Math.min(now, nextHour(t));
-    if (isOfficeHour(new Date(t))) officeAvailMs += next - t;
+    if (isOfficeHour(new Date(t))) officeAvailMs += (next - t) * state.charger.chargers.length;
     t = next;
   }
 
@@ -987,7 +1091,7 @@ function renderUsage({ sessions, drivers }) {
   const finished = sessions.filter((s) => s.ended_at).length;
   $('#usage-tiles').innerHTML = [
     ['Charging sessions', sessions.length],
-    ['Hours on the charger', hrs(totalMs).toFixed(1)],
+    [state.charger.chargers.length > 1 ? 'Hours on the chargers' : 'Hours on the charger', hrs(totalMs).toFixed(1)],
     ['Average session', sessions.length ? fmtDuration(totalMs / sessions.length / 60000) : '—'],
     [`Busy during office hours`, officeAvailMs ? `${Math.round((officeBusyMs / officeAvailMs) * 100)}%` : '—'],
     ['Finished on time', finished ? `${Math.round(((finished - overstays) / finished) * 100)}%` : '—'],

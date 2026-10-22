@@ -8,6 +8,9 @@ import { carImagesFor, modelKey, resolveCarImage } from './carPhotos.js';
 const PORT = Number(process.env.PORT) || 3000;
 // How long the head of the queue has the charger to themselves once it frees up.
 const RESERVE_MINUTES = Number(process.env.RESERVE_MINUTES) || 15;
+// A driver still on the charger this long after their promised end is released
+// automatically, so the charger passes to the queue. 0 = release right away.
+const AUTO_RELEASE_MINUTES = Math.max(0, Number(process.env.AUTO_RELEASE_MINUTES ?? 10) || 0);
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const COOKIE_SECURE = process.env.NODE_ENV === 'production';
 // Who may sign up: work email domains (comma-separated) and/or a shared invite code.
@@ -16,6 +19,12 @@ const ALLOWED_EMAIL_DOMAINS = (process.env.ALLOWED_EMAIL_DOMAINS || '')
   .map((d) => d.trim().toLowerCase().replace(/^@/, ''))
   .filter(Boolean);
 const SIGNUP_CODE = process.env.SIGNUP_CODE || '';
+// Who may change the site settings (site name, number of chargers).
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
+  .split(',')
+  .map((e) => e.trim().toLowerCase())
+  .filter(Boolean);
+const MAX_CHARGERS = 50;
 // Charging history names drivers only this far back; older sessions are anonymous.
 const NAMED_HISTORY_DAYS = 14;
 // A charge counts as on time if it ended within this long of the promised end.
@@ -165,6 +174,8 @@ const serialized = (handler) => (req, res) => withChargerLock(() => handler(req,
 
 // ---------- auth middleware ----------
 
+const isAdmin = (user) => ADMIN_EMAILS.includes(user.email.toLowerCase());
+
 async function auth(req, res, next) {
   const token = parseCookies(req).sid;
   const user =
@@ -176,6 +187,11 @@ async function auth(req, res, next) {
     ));
   if (!user) throw new HttpError(401, 'Please log in');
   req.user = user;
+  next();
+}
+
+function adminOnly(req, res, next) {
+  if (!isAdmin(req.user)) throw new HttpError(403, 'Only an admin can change the site settings');
   next();
 }
 
@@ -245,61 +261,84 @@ const prefetchCarImage = (model) => resolveCarImage(model).then((found) => found
 
 // ---------- charger state ----------
 
-const activeSession = () =>
-  one(
+// The place hosting the chargers and how many there are. Set by an admin.
+const siteSettings = async () => ({
+  name: (await getMeta('site_name')) || 'Office',
+  chargers: Number(await getMeta('charger_count')) || 1,
+});
+
+const activeSessions = () =>
+  all(
     `SELECT c.*, u.name, u.car_model FROM charge_sessions c
-     JOIN users u ON u.id = c.user_id WHERE c.ended_at IS NULL`,
+     JOIN users u ON u.id = c.user_id WHERE c.ended_at IS NULL ORDER BY c.charger_no`,
   );
+
+const activeSessionOf = (userId) =>
+  one('SELECT * FROM charge_sessions WHERE ended_at IS NULL AND user_id = $1', [userId]);
+
+/** Numbers of the chargers nobody is plugged into. */
+function freeChargers(count, active) {
+  const busy = new Set(active.map((a) => a.charger_no));
+  return Array.from({ length: count }, (_, i) => i + 1).filter((n) => !busy.has(n));
+}
 
 const queueRows = () =>
   all(
-    `SELECT q.user_id, q.joined_at, q.note, u.name, u.car_model, u.charge_level,
+    `SELECT q.user_id, q.joined_at, q.note, q.reserved_until, u.name, u.car_model, u.charge_level,
             u.daily_miles, u.full_range_mi
      FROM queue q JOIN users u ON u.id = q.user_id
      ORDER BY q.joined_at, q.user_id`,
   );
 
-// When the charger is free and someone is waiting, hold it for the head of the
-// queue for RESERVE_MINUTES and tell them it's their turn.
-async function refreshReservation() {
-  const [head] = await queueRows();
-  if ((await activeSession()) || !head) {
-    await setMeta('reserved_for', null);
-    await setMeta('reserved_until', null);
-    return;
-  }
-  if (Number(await getMeta('reserved_for')) !== head.user_id) {
-    const until = new Date(Date.now() + RESERVE_MINUTES * 60_000).toISOString();
-    await setMeta('reserved_for', head.user_id);
-    await setMeta('reserved_until', until);
-    await logEvent('your_turn', null, { until }, head.user_id);
+// Hold each free charger for the next driver in the queue for RESERVE_MINUTES
+// and tell them it's their turn. With 2 chargers free, the first 2 in the
+// queue get a hold. A hold with no free charger left for it (e.g. an admin
+// removed one) is dropped.
+async function refreshReservations() {
+  const { chargers } = await siteSettings();
+  const free = freeChargers(chargers, await activeSessions()).length;
+  for (const [i, q] of (await queueRows()).entries()) {
+    if (i < free && !q.reserved_until) {
+      const until = new Date(Date.now() + RESERVE_MINUTES * 60_000).toISOString();
+      await all('UPDATE queue SET reserved_until = $1 WHERE user_id = $2', [until, q.user_id]);
+      await logEvent('your_turn', null, { until }, q.user_id);
+    } else if (i >= free && q.reserved_until) {
+      await all('UPDATE queue SET reserved_until = NULL WHERE user_id = $1', [q.user_id]);
+    }
   }
 }
 
 async function chargerState() {
-  const active = await activeSession();
-  const reservedFor = Number(await getMeta('reserved_for')) || null;
-  const reservedUntil = await getMeta('reserved_until');
-  const reservation =
-    reservedFor && reservedUntil && reservedUntil > nowIso()
-      ? {
-          user_id: reservedFor,
-          name: (await one('SELECT name FROM users WHERE id = $1', [reservedFor]))?.name,
-          until: reservedUntil,
-        }
-      : null;
+  const site = await siteSettings();
+  const active = new Map((await activeSessions()).map((a) => [a.charger_no, a]));
+  const now = nowIso();
+  // A lapsed hold stays on the row until the background job removes it, but no longer counts.
+  const queue = (await queueRows()).map((q) => ({
+    ...q,
+    reserved_until: q.reserved_until && q.reserved_until > now ? q.reserved_until : null,
+  }));
   return {
-    active: active && {
-      id: active.id,
-      user_id: active.user_id,
-      name: active.name,
-      car_model: active.car_model,
-      started_at: active.started_at,
-      expected_end: active.expected_end,
-      start_level: active.start_level,
-    },
-    queue: await queueRows(),
-    reservation,
+    site_name: site.name,
+    chargers: Array.from({ length: site.chargers }, (_, i) => {
+      const a = active.get(i + 1);
+      return {
+        no: i + 1,
+        session: a && {
+          id: a.id,
+          user_id: a.user_id,
+          name: a.name,
+          car_model: a.car_model,
+          started_at: a.started_at,
+          expected_end: a.expected_end,
+          start_level: a.start_level,
+        },
+      };
+    }),
+    queue,
+    // Drivers a free charger is being held for, in queue order.
+    reservations: queue
+      .filter((q) => q.reserved_until)
+      .map((q) => ({ user_id: q.user_id, name: q.name, until: q.reserved_until })),
   };
 }
 
@@ -397,11 +436,12 @@ app.get('/api/state', auth, async (req, res) => {
   const drivers = await withCarImages(users);
   const events = (await all(`${eventSelect} ORDER BY e.id DESC LIMIT 60`)).map(formatEvent);
   res.json({
-    me: { ...drivers.find((d) => d.id === req.user.id), units: req.user.units },
+    me: { ...drivers.find((d) => d.id === req.user.id), units: req.user.units, is_admin: isAdmin(req.user) },
     drivers,
     charger: await chargerState(),
     events,
     reserve_minutes: RESERVE_MINUTES,
+    auto_release_minutes: AUTO_RELEASE_MINUTES,
   });
 });
 
@@ -438,19 +478,25 @@ app.get('/api/users/:id/profile', auth, async (req, res) => {
 
   const charger = await chargerState();
   const queueIndex = charger.queue.findIndex((q) => q.user_id === id);
-  const status =
-    charger.active?.user_id === id
-      ? { state: 'charging', started_at: charger.active.started_at, expected_end: charger.active.expected_end }
-      : charger.reservation?.user_id === id
-        ? { state: 'reserved', until: charger.reservation.until }
-        : queueIndex >= 0
-          ? {
-              state: 'queued',
-              position: queueIndex + 1,
-              note: charger.queue[queueIndex].note,
-              joined_at: charger.queue[queueIndex].joined_at,
-            }
-          : { state: 'idle' };
+  const plugged = charger.chargers.find((c) => c.session?.user_id === id);
+  const reservation = charger.reservations.find((r) => r.user_id === id);
+  const status = plugged
+    ? {
+        state: 'charging',
+        charger: plugged.no,
+        started_at: plugged.session.started_at,
+        expected_end: plugged.session.expected_end,
+      }
+    : reservation
+      ? { state: 'reserved', until: reservation.until }
+      : queueIndex >= 0
+        ? {
+            state: 'queued',
+            position: queueIndex + 1,
+            note: charger.queue[queueIndex].note,
+            joined_at: charger.queue[queueIndex].joined_at,
+          }
+        : { state: 'idle' };
 
   const events = (
     await all(`${eventSelect} WHERE e.user_id = $1 OR e.target_user_id = $1 ORDER BY e.id DESC LIMIT 15`, [id])
@@ -530,7 +576,7 @@ app.delete(
     }
     await all('DELETE FROM events WHERE user_id = $1 OR target_user_id = $1', [req.user.id]);
     await all('DELETE FROM users WHERE id = $1', [req.user.id]); // cascades sessions, charging history, queue
-    await refreshReservation();
+    await refreshReservations();
     broadcastRefresh();
     setSessionCookie(res, '', 0);
     res.json({ ok: true });
@@ -551,23 +597,32 @@ app.post(
   serialized(async (req, res) => {
     const expectedEnd = futureTime(req.body?.expected_end);
     const me = req.user;
-    if (await activeSession()) throw new HttpError(409, 'The charger is already in use');
-    const { reservation } = await chargerState();
-    if (reservation && reservation.user_id !== me.id) {
+    const { chargers, reservations } = await chargerState();
+    if (chargers.some((c) => c.session?.user_id === me.id)) throw new HttpError(409, "You're already charging");
+    const free = chargers.filter((c) => !c.session).map((c) => c.no);
+    if (!free.length) {
+      throw new HttpError(409, chargers.length > 1 ? 'All chargers are in use' : 'The charger is already in use');
+    }
+    // Free chargers held for drivers in the queue are theirs first.
+    if (!reservations.some((r) => r.user_id === me.id) && free.length <= reservations.length) {
       throw new HttpError(
         409,
-        `The charger is reserved for ${reservation.name} (next in the queue) for a few more minutes`,
+        `${free.length > 1 ? 'The free chargers are' : 'The charger is'} reserved for ${reservations
+          .map((r) => r.name)
+          .join(', ')} (next in the queue) for a few more minutes`,
       );
     }
-    await all('INSERT INTO charge_sessions(user_id, started_at, expected_end, start_level) VALUES ($1, $2, $3, $4)', [
-      me.id,
-      nowIso(),
-      expectedEnd,
-      me.charge_level,
-    ]);
+    const wanted = req.body?.charger;
+    const chargerNo = wanted === undefined || wanted === null || wanted === '' ? free[0] : Number(wanted);
+    if (!chargers.some((c) => c.no === chargerNo)) throw new HttpError(400, 'Pick one of the chargers');
+    if (!free.includes(chargerNo)) throw new HttpError(409, `Charger ${chargerNo} is already in use`);
+    await all(
+      'INSERT INTO charge_sessions(user_id, charger_no, started_at, expected_end, start_level) VALUES ($1, $2, $3, $4, $5)',
+      [me.id, chargerNo, nowIso(), expectedEnd, me.charge_level],
+    );
     await all('DELETE FROM queue WHERE user_id = $1', [me.id]);
-    await logEvent('start', me.id, { expected_end: expectedEnd, charge_level: me.charge_level });
-    await refreshReservation();
+    await logEvent('start', me.id, { expected_end: expectedEnd, charge_level: me.charge_level, charger: chargerNo });
+    await refreshReservations();
     res.json(await chargerState());
   }),
 );
@@ -577,8 +632,8 @@ app.post(
   auth,
   serialized(async (req, res) => {
     const expectedEnd = futureTime(req.body?.expected_end);
-    const active = await activeSession();
-    if (!active || active.user_id !== req.user.id) throw new HttpError(403, "You're not the one charging right now");
+    const active = await activeSessionOf(req.user.id);
+    if (!active) throw new HttpError(403, "You're not charging right now");
     await all('UPDATE charge_sessions SET expected_end = $1, overdue_notified = FALSE WHERE id = $2', [
       expectedEnd,
       active.id,
@@ -592,8 +647,8 @@ app.post(
   '/api/charger/end',
   auth,
   serialized(async (req, res) => {
-    const active = await activeSession();
-    if (!active || active.user_id !== req.user.id) throw new HttpError(403, "You're not the one charging right now");
+    const active = await activeSessionOf(req.user.id);
+    if (!active) throw new HttpError(403, "You're not charging right now");
     const endLevel = num(req.body?.end_level, 'Charge level', 0, 100, null);
     const now = nowIso();
     await all('UPDATE charge_sessions SET ended_at = $1, end_level = $2 WHERE id = $3', [now, endLevel, active.id]);
@@ -601,8 +656,8 @@ app.post(
       await all('UPDATE users SET charge_level = $1, updated_at = $2 WHERE id = $3', [endLevel, now, req.user.id]);
     }
     const minutes = Math.round((Date.parse(now) - Date.parse(active.started_at)) / 60_000);
-    await logEvent('end', req.user.id, { minutes, end_level: endLevel });
-    await refreshReservation();
+    await logEvent('end', req.user.id, { minutes, end_level: endLevel, charger: active.charger_no });
+    await refreshReservations();
     res.json(await chargerState());
   }),
 );
@@ -612,14 +667,14 @@ app.post(
   auth,
   serialized(async (req, res) => {
     const note = str(req.body?.note, 'Note', 140, { optional: true });
-    if ((await activeSession())?.user_id === req.user.id) throw new HttpError(409, "You're already charging");
+    if (await activeSessionOf(req.user.id)) throw new HttpError(409, "You're already charging");
     const joined = await one(
       'INSERT INTO queue(user_id, joined_at, note) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO NOTHING RETURNING user_id',
       [req.user.id, nowIso(), note],
     );
     if (!joined) throw new HttpError(409, "You're already in the queue");
     await logEvent('queue_join', req.user.id, { note });
-    await refreshReservation();
+    await refreshReservations();
     res.json(await chargerState());
   }),
 );
@@ -631,8 +686,38 @@ app.post(
     const left = await one('DELETE FROM queue WHERE user_id = $1 RETURNING user_id', [req.user.id]);
     if (!left) throw new HttpError(409, "You're not in the queue");
     await logEvent('queue_leave', req.user.id);
-    await refreshReservation();
+    await refreshReservations();
     res.json(await chargerState());
+  }),
+);
+
+// ---------- routes: admin ----------
+
+// Name the place hosting the chargers and set how many there are. A charger
+// someone is plugged into can't be removed until they unplug.
+app.put(
+  '/api/admin/site',
+  auth,
+  adminOnly,
+  serialized(async (req, res) => {
+    const name = str(req.body?.site_name, 'Site name', 60);
+    const count = num(req.body?.charger_count, 'Number of chargers', 1, MAX_CHARGERS);
+    if (!Number.isInteger(count)) throw new HttpError(400, 'Number of chargers must be a whole number');
+    const inUse = (await activeSessions()).find((a) => a.charger_no > count);
+    if (inUse) {
+      throw new HttpError(
+        409,
+        `Charger ${inUse.charger_no} is in use by ${inUse.name}. You can remove it once it's free.`,
+      );
+    }
+    const before = await siteSettings();
+    await setMeta('site_name', name);
+    await setMeta('charger_count', count);
+    if (before.name !== name || before.chargers !== count) {
+      await logEvent('site', req.user.id, { name, chargers: count });
+    }
+    await refreshReservations(); // more chargers may free up a turn for the queue
+    res.json({ ok: true });
   }),
 );
 
@@ -705,25 +790,39 @@ setInterval(async () => {
   try {
     // Nudge the driver (and everyone waiting) when the promised end time passes.
     // One conditional update, so an end or extend racing this can't be clobbered.
-    const overdue = await one(
+    const overdue = await all(
       `UPDATE charge_sessions SET overdue_notified = TRUE
        WHERE ended_at IS NULL AND NOT overdue_notified AND expected_end < $1
-       RETURNING user_id, expected_end`,
+       RETURNING user_id, expected_end, charger_no`,
       [nowIso()],
     );
-    if (overdue) await logEvent('overdue', null, { expected_end: overdue.expected_end }, overdue.user_id);
+    for (const o of overdue) {
+      await logEvent('overdue', null, { expected_end: o.expected_end, charger: o.charger_no }, o.user_id);
+    }
 
-    // If the head of the queue let their hold lapse, drop them so the charger
-    // passes to the next driver instead of sitting idle.
     await withChargerLock(async () => {
-      const reservedFor = Number(await getMeta('reserved_for'));
-      const reservedUntil = await getMeta('reserved_until');
-      if (!reservedFor || !reservedUntil || reservedUntil >= nowIso() || (await activeSession())) return;
-      const [head] = await queueRows();
-      if (head?.user_id !== reservedFor) return;
-      await all('DELETE FROM queue WHERE user_id = $1', [reservedFor]);
-      await logEvent('queue_skipped', null, { until: reservedUntil }, reservedFor);
-      await refreshReservation();
+      // Release drivers whose charging time ran out (plus the grace period),
+      // so the charger passes to the next driver in the queue.
+      const now = nowIso();
+      const cutoff = new Date(Date.now() - AUTO_RELEASE_MINUTES * 60_000).toISOString();
+      const released = await all(
+        `UPDATE charge_sessions SET ended_at = $1
+         WHERE ended_at IS NULL AND expected_end <= $2
+         RETURNING user_id, charger_no, started_at`,
+        [now, cutoff],
+      );
+      for (const r of released) {
+        const minutes = Math.round((Date.parse(now) - Date.parse(r.started_at)) / 60_000);
+        await logEvent('auto_end', null, { minutes, charger: r.charger_no }, r.user_id);
+      }
+
+      // Drivers who let their hold lapse leave the queue, so the charger passes
+      // to the next driver instead of sitting idle.
+      const lapsed = await all('DELETE FROM queue WHERE reserved_until < $1 RETURNING user_id, reserved_until', [
+        nowIso(),
+      ]);
+      for (const q of lapsed) await logEvent('queue_skipped', null, { until: q.reserved_until }, q.user_id);
+      if (released.length || lapsed.length) await refreshReservations();
     });
     await all('DELETE FROM sessions WHERE expires_at < $1', [nowIso()]);
     rateLimits.forEach((limit) => limit.prune());

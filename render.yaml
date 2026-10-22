@@ -19,3 +19,6 @@ services:
         sync: false
       - key: SIGNUP_CODE
         sync: false
+      # Emails of the admins who set the site name and number of chargers.
+      - key: ADMIN_EMAILS
+        sync: false
