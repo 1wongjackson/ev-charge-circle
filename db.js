@@ -46,7 +46,7 @@ await rawExec(`
     expires_at TEXT NOT NULL
   );
 
-  -- One row per use of the shared charger. ended_at IS NULL = currently charging.
+  -- One row per use of a charger. ended_at IS NULL = currently charging.
   CREATE TABLE IF NOT EXISTS charge_sessions (
     id               SERIAL PRIMARY KEY,
     user_id          INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -57,7 +57,6 @@ await rawExec(`
     end_level        DOUBLE PRECISION,
     overdue_notified BOOLEAN NOT NULL DEFAULT FALSE
   );
-  CREATE UNIQUE INDEX IF NOT EXISTS one_active_charge ON charge_sessions ((ended_at IS NULL)) WHERE ended_at IS NULL;
   CREATE INDEX IF NOT EXISTS charge_sessions_started ON charge_sessions(started_at);
 
   CREATE TABLE IF NOT EXISTS queue (
@@ -88,6 +87,21 @@ await rawExec(`
     key   TEXT PRIMARY KEY,
     value TEXT
   );
+
+  -- Several chargers (how many is set by an admin): each session says which
+  -- one it is on, numbered from 1. A charger, and a driver, has at most one
+  -- session going at a time.
+  ALTER TABLE charge_sessions ADD COLUMN IF NOT EXISTS charger_no INTEGER NOT NULL DEFAULT 1;
+  DROP INDEX IF EXISTS one_active_charge;
+  CREATE UNIQUE INDEX IF NOT EXISTS one_active_per_charger ON charge_sessions(charger_no) WHERE ended_at IS NULL;
+  CREATE UNIQUE INDEX IF NOT EXISTS one_active_per_driver ON charge_sessions(user_id) WHERE ended_at IS NULL;
+
+  -- Set while a free charger is held for this driver (they're next in the queue).
+  ALTER TABLE queue ADD COLUMN IF NOT EXISTS reserved_until TEXT;
+  -- With one charger, the single hold lived in meta; move it to the queue.
+  UPDATE queue SET reserved_until = (SELECT value FROM meta WHERE key = 'reserved_until')
+    WHERE user_id = (SELECT value::int FROM meta WHERE key = 'reserved_for') AND reserved_until IS NULL;
+  DELETE FROM meta WHERE key IN ('reserved_for', 'reserved_until');
 `);
 
 export const getMeta = async (key) => (await one('SELECT value FROM meta WHERE key = $1', [key]))?.value ?? null;

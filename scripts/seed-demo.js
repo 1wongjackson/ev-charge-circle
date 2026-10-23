@@ -105,11 +105,7 @@ async function removeDemo() {
   const ids = (await all('SELECT id FROM users WHERE email LIKE $1', [DEMO_EMAIL])).map((r) => r.id);
   if (!ids.length) return 0;
   await all('DELETE FROM events WHERE user_id = ANY($1) OR target_user_id = ANY($1)', [ids]);
-  await all('DELETE FROM users WHERE id = ANY($1)', [ids]); // cascades sessions, charging history, queue
-  await all(
-    "DELETE FROM meta WHERE key IN ('reserved_for', 'reserved_until') AND (SELECT value FROM meta WHERE key = 'reserved_for')::int = ANY($1)",
-    [ids],
-  );
+  await all('DELETE FROM users WHERE id = ANY($1)', [ids]); // cascades sessions, charging history, queue and holds
   return ids.length;
 }
 

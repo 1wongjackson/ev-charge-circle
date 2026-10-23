@@ -25,8 +25,8 @@
   <!-- ===== Auth ===== -->
   <main id="auth-view" class="auth">
     <section class="card auth-card">
-      <h1>Share one charger, without the hallway politics.</h1>
-      <p class="muted">See who's low on charge, line up for the office charger, and get pinged when it's your turn.</p>
+      <h1>Share the office chargers, without the hallway politics.</h1>
+      <p class="muted">See who's low on charge, line up for a charger, and get pinged when it's your turn.</p>
 
       <div class="tabs" role="tablist" aria-label="Account">
         <button class="tab active" id="tab-login" data-auth="login" type="button" role="tab" aria-selected="true" aria-controls="login-form">Log in</button>
@@ -77,7 +77,7 @@
         <!-- Charger -->
         <article class="card charger" id="charger-card">
           <div class="charger-head">
-            <h2>Office charger</h2>
+            <h2 id="charger-title">Office charger</h2>
             <span id="charger-status" class="badge"></span>
           </div>
           <div id="charger-body"></div>
@@ -103,6 +103,20 @@
       </div>
 
       <aside class="col-side">
+        <!-- Site settings, for admins only -->
+        <article class="card" id="admin-card" hidden>
+          <div class="charger-head">
+            <h2>Charging site</h2>
+            <span class="badge reserved">Admin</span>
+          </div>
+          <form id="site-form" class="form">
+            <label>Name of the place hosting the chargers <input name="site_name" maxlength="60" placeholder="e.g. Acme HQ car park" required /></label>
+            <label>Number of chargers <input name="charger_count" type="number" min="1" max="50" step="1" required /></label>
+            <button type="submit">Save</button>
+            <p id="site-msg" class="muted small-text" role="status"></p>
+          </form>
+        </article>
+
         <!-- My status -->
         <article class="card">
           <h2>My car</h2>
